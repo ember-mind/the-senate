@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install tmux process-backend prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+          tmux -V
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --test process_tmux --no-fail-fast
+      - run: cargo test
+
+  # Cargo.toml's rust-version is a promise; this is the check that keeps it.
+  # Let-chains (Rust 2024) need 1.88.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --all-targets --locked

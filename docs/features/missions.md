@@ -1,0 +1,77 @@
+# Missions
+
+Plan a project goal above individual runs, break it into work packages with dependencies, and drive each one as a child run.
+
+## Sub-features
+- mission-lifecycle: Planning -> Active -> {Completed, Cancelled}. A mission starts `Planning` and moves to `Active` the moment its first package starts; `Completed` and `Cancelled` close it, and no package moves afterwards.
+- package-lifecycle: Planned -> Ready -> Running -> {Blocked, Failed} -> Delivered -> Integrated, or Cancelled from Planned/Ready/Failed. `Ready` means every dependency is `Integrated`, so a run started for the package sees their changes in its base; `Delivered` means the child run completed; `Integrated` means its change reached the source checkout.
+- readiness: a package becomes `Ready` only once every package it depends on is `Integrated`. Adding, revising or re-pointing dependencies can only touch a package nothing has run for yet.
+- frozen-contract: a package's contract (title, goal, rationale, scope, acceptance criteria, verification, workflow) is free to revise while `Planned`, `Ready` or `Failed`; once a run has served it, the contract is frozen and `mission revise` is refused.
+- observe-pass: `mission show` and every mutating command first maps each running package's bound run to committed run status before doing anything else: `NeedsUser`, `Paused` or `Interrupted` -> `Blocked` (with the pending request, or a note to resume or discard), `Completed`/`Applied` -> `Delivered`, `Failed`/`Discarded` -> `Failed` (with the run's failure reason); a run is never driven by a read.
+- handoff: the task a child run receives is rendered from mission state, not typed by hand — the package's goal, rationale, scope, acceptance criteria, verification, its integrated dependencies' contracts, and every recorded decision (`handoff_task` in `src/app/mission_service.rs`).
+- integration-evidence: `mission integrate` brings a delivered package in. A `Completed` run whose worktree still holds the change is applied first, exactly as `senate apply` would (same verification gate, same patch transfer), and the outcome is the evidence: `IntegrationEvidence::Applied`, or `IntegrationEvidence::NoChanges` when the delta was empty. A run already `Applied`, or `Completed` with its worktree released by an earlier empty apply, integrates on that evidence without touching the checkout. Any other run status is refused.
+- handoff-record: the moment a started package's run is persisted, a `mission_handoffs` row binds it to the mission state its task was rendered from — the contract's hash, the task's hash and size, the dependencies and decisions it named — in the same transaction as the binding. `mission show` prints nothing for it unless the contract no longer hashes to what the run was given; a run attached by hand has no record.
+- delivery-result: when a package's run is first seen `Completed`/`Applied`, its evidence is captured from the run store and kept with the package (`WorkPackageResult`): changed files against the base (bounded to 200, marked incomplete past that), the latest verify stage's status, every review stage's status, the latest decision's status, and the newest editing stage's, each review's and the decision's own `## Bottom line` quoted verbatim, plus the decision's `## Follow-ups` verbatim. Nothing is summarized. It survives the worktree being released.
+- rework: `mission fix` / `mission continue` grow the delivered package's own run by a fix or continue cycle (exactly `senate fix` and the TUI's `c`); the package reads in progress again on the same run and is delivered afresh, with a new result, when the cycle completes. A cycle started outside the mission (`senate fix <run>`) is noticed too: a delivered run with more stages than its result covers is re-delivered on the next observe pass.
+- resume: `mission resume` calls `senate resume` for every package run that is prepared, running, paused, or interrupted, then observes: the fan-in for packages started on native providers, whose runs outlive the command that started them (`mission start` returns when the provider is at work). Several ready packages may be started one after another.
+- run-binding: a run bound to a package (`mission start` or `mission attach`) cannot be deleted (`AppError`/`StoreError::RunBoundToMission`) while the binding stands.
+- decisions: `mission decide` records one design decision (title, rationale, author `user`|`lead`); insert-only, quoted into every later package's handoff.
+- attention: `mission show`'s "Needs you" section lists every package that is `Blocked` (with its run's pending attention summary), `Failed` (with its reason), or `Delivered` and awaiting `mission integrate`.
+- lead: `mission ask` talks to the mission's lead. The lead is one run per mission (`WorkflowKind::Lead`, bound in `mission_leads`): the first message starts it over the mission's checkout with a detached, read-only worktree; every later message appends one `lead_N` stage to the same run, so the conversation is restart-safe and every turn is an artifact. Each turn's instruction is the **mission brief** rendered from the read model (goal, every package with its state, dependencies, acceptance and delivered bottom line, decisions, what needs the user) followed by the message — canonical state, never a chat log; the previous turn's artifact is the stage's dependency. The lead answers in prose and, when the plan should move, a `## Plan changes` section in a fixed grammar (`- add \`id\`: Title` with `goal:`/`why:`/`accept:`/`workflow:`/`depends on:` fields, `- revise \`id\``, `- cancel \`id\`: reason`, `- decide: Title` with `why:`, or `- none`). The Senate parses it (`parse_plan_changes`) and lists the changes; nothing lands until `mission apply` (or `mission ask --apply`), which applies the latest answer's changes in one commit, all or none. A lead run cannot be deleted while it is bound.
+- tui: the control room presents a mission as a Campaign (a work package as an Order, integrated as `settled`, the lead as the Consul). Its `M` screen lists missions and opens one into a Consul/Campaign pane pair; from there `S` starts a ready package, `u` answers what a package's run asks, `I` brings a finished package in, `A` auto-approves the mission's runs, `W` opens the campaign's 3D view (the Senate), and Enter opens a package's run (see control-room.md). Planning commands stay CLI-only.
+
+## How to get to it (user POV)
+Create a mission over a Git checkout with `senate mission new`, add work packages with their dependencies, and start a ready package with `senate mission start`; that drives its child run to quiescence in the foreground, exactly like `senate fast` would, then reports the mission. Once a package's run has completed, run `senate mission integrate` to bring it into the checkout (it applies the run if that has not happened yet), which readies any package that depended on it. `senate mission show` at any point prints every package, its current run, recorded decisions, and what needs you.
+
+## Driving it
+```bash
+senate mission new "<title>" --goal "<goal>" [--repo <path>]
+senate mission list
+senate mission show <mission-id>
+senate mission add <mission-id> <package-id> --title "<title>" --goal "<goal>" [--why "<rationale>"] [--scope "<scope>"] [--accept "<criterion>" ...] [--verify "<verification>"] [--workflow fast|standard|deep|review] [--depends-on <package-id> ...]
+senate mission revise <mission-id> <package-id> [--title "<title>"] [--goal "<goal>"] [--why "<rationale>"] [--scope "<scope>"] [--accept "<criterion>" ...] [--verify "<verification>"] [--workflow fast|standard|deep|review]
+senate mission depends <mission-id> <package-id> [--on <package-id> ...]
+senate mission start <mission-id> <package-id> [--provider claude|codex|fake | --profile recommended] [--effort native|low|medium|high|xhigh]
+senate mission attach <mission-id> <package-id> <run-id>
+senate mission integrate <mission-id> <package-id>
+senate mission retry <mission-id> <package-id>
+senate mission fix <mission-id> <package-id>
+senate mission continue <mission-id> <package-id> "<instruction>"
+senate mission resume <mission-id>
+senate mission ask <mission-id> "<message>" [--provider claude|codex|fake | --profile recommended] [--effort native|low|medium|high|xhigh] [--apply]
+senate mission apply <mission-id>
+senate mission cancel-package <mission-id> <package-id> [--reason "<reason>"]
+senate mission decide <mission-id> "<title>" --why "<rationale>" [--by user|lead]
+senate mission complete <mission-id>
+senate mission cancel <mission-id> [--reason "<reason>"]
+```
+`mission ask` prints the lead's answer (its prose, then the proposed plan changes as one line each with the command that applies them, or "No plan changes proposed."), then the mission; a mission with a lead shows `Lead: run <id> (<status>), <n> turn(s)`. `mission apply` lists the changes it applies, then the mission. Every other command prints the mission after the change: status, repository, goal, packages in dependency order with status/goal/dependencies/current run/reason, a delivered package's evidence line (`delivered: <n> file(s) changed; verify <status>; <review statuses>`, then `said:`/`decision:` quoting the artifacts' own bottom lines), decisions, and a "Needs you" section (or "Nothing needs you."). `mission start` additionally prints the child run's own report first, the same shape `senate fast` prints. `mission list` prints one line per mission (`<id>  <status>  <integrated>/<packages> integrated  <active> active  <attention> need you  <title>`), or `No missions yet.`.
+
+## Where it lives
+- `src/domain/mission.rs` — `Mission` aggregate, `WorkPackage`, `WorkPackageContract`, `WorkPackageStatus`, `MissionStatus`, `DecisionAuthor`, `MissionAttention`, `MissionError`, `IntegrationEvidence`.
+- `src/store/mission.rs` — persistence for missions, packages, decisions, and the run-to-package binding.
+- `src/store/migrations.rs` — `migrate_v10` creates the mission schema.
+- `src/app/mission_service.rs` — `MissionService` use cases (`create_mission`, `add_package`, `revise_package`, `set_dependencies`, `start_package`, `attach_run`, `integrate_package`, `rework_package`, `resume_mission`, `retry_package`, `cancel_package`, `record_decision`, `complete_mission`, `cancel_mission`), `handoff_task`, the observe pass (`observe_runs`).
+- `src/app/mission_query.rs` — `MissionDetails`, `MissionListItem`, `WorkPackageSummary`, `DecisionSummary`, `HandoffSummary` read models.
+- `src/app/mission_result.rs` — `capture`: the delivery result read from the run store; `preview_delta`: the same bounded delta apply would move.
+- `src/app/mission_lead.rs` — `brief` (the mission rendered for the lead), `turn`, `latest_answer`, `LeadAnswer`/`LeadTurn`/`LeadSummary`; `src/domain/plan_change.rs` — `PlanChange`, `parse_plan_changes`, the grammar; `src/domain/workflow.rs` — `WorkflowKind::Lead`, `StageKind::Lead`, `lead_turn_stages`, `next_lead_stage_id`; `src/domain/run.rs` — `Run::request_lead_turn`; `src/providers/stage_prompt.rs` — `LEAD_TURN`, the lead's contract; `src/store/migrations.rs` — `migrate_v12` creates `mission_leads`.
+- `src/store/mission.rs` — `MissionHandoffRecord`, `commit_mission_update_with`, `list_mission_handoffs`, `contract_sha256`; `migrate_v11` creates `mission_handoffs`.
+- `src/cli/mod.rs` — `MissionCommand`, `ContractArgs`, `ReviseArgs`.
+- `src/cli/commands.rs` — `mission` dispatch, `print_mission`, `print_mission_list`, `build_contract`, `revise_contract`, `parse_workflow`, `parse_decision_author`.
+- `src/tui/render.rs` — `render_missions`, `render_mission_detail`; `src/tui/app.rs` — `start_selected_package`, `open_integrate_confirmation`, `refresh_missions`.
+
+## Gotchas
+- `mission fix` needs what `senate fix` needs: a `Completed` run with a decision stage. A `fast` package's run has none, so the fix is refused by the run and the package stays delivered; use `mission continue` on a `standard`/`deep` package, or retry the package on a new run.
+- The result's changed-file list is read only while the run's worktree is `Ready`; a run whose apply found nothing has no worktree and lists nothing, which is also the truth.
+- A corrupt artifact fails the delivery capture (and so the `show`/mutation that triggered it) rather than leaving a hole in a result that is kept for good; a stage that wrote no artifact simply quotes nothing. A rework that fails clears the previous result: a `Failed` package shows its reason, never an old delivery.
+- `mission start` drives its child run to quiescence in the foreground exactly like `senate fast`/`standard`/`deep`/`review` does; it is not fire-and-forget, and if the run started but could not be bound (a crash between the two), the error names the run id so `senate mission attach <mission> <package> <run-id>` can bind it by hand.
+- `mission cancel` and `mission cancel-package` refuse while the package has a live run (`Running` or `Blocked`, which includes a stopped run) — `senate discard <run-id>` first; the package then reads `Failed` and can be cancelled.
+- Cancelling a package other packages still depend on is refused; cancel or integrate the dependents first, or cancel the whole mission.
+- `mission integrate` applies the run itself when its change is still in the worktree, so a failed verification refuses the integration with apply's own reason; fix or retry the run, then integrate again.
+- A package's contract and dependencies can only be revised while nothing has run for it (`Planned`, `Ready`, or `Failed`); once a run is bound, `mission revise`/`mission depends` are refused and the package must be retried or cancelled instead.
+- `mission attach` requires the run to belong to the mission's own repository; a run started against a different checkout is refused with a repository mismatch.
+- A run bound to a mission package cannot be deleted while the binding stands; integrate or cancel the package first. The same holds for the mission's lead run.
+- `mission ask --provider/--profile/--effort` route the lead session when it starts; on a later turn they are ignored (the run's configuration is sealed) and the command says so. `mission apply` applies the newest *completed* turn's answer: a turn still at work or one that failed does not hide the answer before it.
+- `mission ask` while the lead is still at work on an earlier turn (running, waiting on you, paused, interrupted) is refused; `senate status <lead-run>` shows where it is, `senate resolve`/`resume`/`discard` move it. A failed or discarded lead is history: the next message opens a fresh lead run.
+- The fake provider writes no artifact, so `mission ask --provider fake` completes with "no answer yet" and `mission apply` reports no lead answer; the parser and the apply path are tested with artifacts written directly.
+- A refused proposal (an unknown package to cancel, a cycle, a package already running) refuses the whole batch: `mission apply` commits every change of an answer or none.

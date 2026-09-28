@@ -1,0 +1,43 @@
+[package]
+name = "senate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+default-run = "senate"
+description = "The Senate: put a lead in charge of your AI coding agents"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ember-mind/the-senate"
+exclude = [".project-meta.yaml", "PROJECT.md", "ZSHRC-FUNCTION.txt"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28.1"
+ratatui = "0.29.0"
+rustix = { version = "0.38", features = ["process"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+signal-hook = "0.3"
+tempfile = "3.27.0"
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = { version = "1", features = ["serde"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[[bin]]
+name = "senate"
+path = "src/main.rs"

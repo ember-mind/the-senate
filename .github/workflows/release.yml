@@ -1,0 +1,178 @@
+name: Release
+
+# Official releases are cut by pushing a canonical tag. The updater only ever
+# considers `vMAJOR.MINOR.PATCH`, so the trigger matches exactly that shape.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing canonical tag to build and publish (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  # Nothing is built or published until the tag is proven to be a canonical
+  # release tag naming exactly the version this checkout compiles as. The rule
+  # lives in Rust (`update::verify_release_tag`), the same one the updater uses
+  # to decide which tags are official, so the pipeline and the client can never
+  # disagree. Both the tag push and workflow_dispatch pass through here.
+  guard:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag must match Cargo.toml package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "candidate tag: $tag"
+          cargo run --quiet --locked -- __verify-release-tag "$tag"
+
+  # No asset may be built, and therefore none may be published, until the
+  # tagged source passes the same quality gate normal CI enforces. The
+  # dependency is structural: waiting for CI by hand is not a gate.
+  quality:
+    name: Quality gate
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install tmux process-backend prerequisite
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tmux
+          tmux -V
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --test process_tmux --no-fail-fast
+      - run: cargo test
+
+  build:
+    name: ${{ matrix.target }}
+    needs: quality
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Every asset is built natively on its own architecture, so the
+          # binary that ships is the binary that was tested there. Windows is
+          # absent deliberately: The Senate requires tmux and neither supports
+          # nor tests Windows.
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The guard proved tag == Cargo.toml version. This proves the *built
+      # asset* reports it too, which is the property the updater checks before
+      # installing.
+      - name: Verify the binary reports the tagged version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          expected="${tag#v}"
+          reported="$(./target/${{ matrix.target }}/release/senate --version | awk '{print $2}')"
+          echo "tag=$expected reported=$reported"
+          # The updater refuses an asset whose version disagrees with the
+          # release; catching that here keeps such a release from existing.
+          test "$expected" = "$reported"
+
+      - name: Name the asset for the updater
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/senate" "dist/senate-${{ matrix.target }}"
+          chmod 755 "dist/senate-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: senate-${{ matrix.target }}
+          path: dist/senate-${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      - name: Collect assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp staged/senate-* dist/
+          chmod 755 dist/senate-*
+          ls -l dist
+
+      - name: Generate checksums over the final assets
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Generated last, over exactly the files that will be uploaded, so
+          # the manifest can never describe a different build than the one
+          # published. Names are bare so the updater matches them directly.
+          sha256sum senate-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Stable and published: the updater ignores drafts and prereleases,
+          # so a release created any other way would never be offered.
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "The Senate $TAG" \
+            --generate-notes \
+            --latest \
+            dist/senate-* dist/SHA256SUMS

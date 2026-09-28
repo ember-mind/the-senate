@@ -1,0 +1,15 @@
+/target/
+.DS_Store
+*.swp
+
+# Local Dragon Lodge project integration (contains machine-specific paths).
+/.project-meta.yaml
+/PROJECT.md
+/ZSHRC-FUNCTION.txt
+
+# Claude Code local worktrees/session data
+/.claude/
+
+# Full-size KayKit sources; the world ships the .min.glb builds.
+/world/assets/chars/*.glb
+!/world/assets/chars/*.min.glb

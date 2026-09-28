@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Senate</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="world"></canvas>
+<div id="labels"></div>
+
+<header id="brand">
+  <span class="mark"></span>
+  <div>
+    <div class="name">THE SENATE</div>
+    <div class="sub"><span id="campaign-title">—</span> <span id="campaign-chip" class="chip"></span></div>
+    <div class="count"><span id="campaign-count"></span> <span id="source"></span></div>
+  </div>
+</header>
+
+<nav id="views" aria-label="View">
+  <button data-view="overview" class="on">Overview</button>
+  <button data-view="walk">Walk</button>
+</nav>
+
+<div id="help">
+  <span class="overview-only"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Q</kbd><kbd>E</kbd> turn · drag to look · scroll to zoom · click anyone to inspect · <kbd>Tab</kbd> walk as you</span>
+  <span class="walk-only"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · drag to look · <kbd>E</kbd> interact · <kbd>Tab</kbd> overview</span>
+</div>
+
+<div id="prompt" hidden></div>
+
+<aside id="panel" hidden>
+  <button id="panel-close" aria-label="Close">×</button>
+  <div id="panel-body"></div>
+</aside>
+
+<div id="offline">Lost contact with the Senate. Agents keep working; this view reconnects when the server is back.</div>
+
+<div id="loading">
+  <div class="seal"></div>
+  <div class="word">THE SENATE</div>
+  <div class="sub">Entering…</div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
