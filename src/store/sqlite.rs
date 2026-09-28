@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -137,8 +137,22 @@ impl SqliteStore {
         // connection, and setting it takes a lock on a file other connections
         // may be writing to. Every open after the first would be paying for a
         // change that has already happened, so ask before telling.
-        if !journal_mode_is_wal(&connection)? {
-            connection.pragma_update(None, "journal_mode", "WAL")?;
+        //
+        // Two connections switching a fresh file at once can collide in a way
+        // SQLite reports as busy at once rather than waiting out the busy
+        // timeout (it would otherwise deadlock), so the switch is retried
+        // within the same five seconds.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // An in-memory database answers `memory` whatever it is told, so
+        // one accepted request ends the loop.
+        while !journal_mode_is_wal(&connection)? {
+            match connection.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(error) if is_busy(&error) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         // Left to itself the write-ahead log only truncates at a thousand
@@ -1095,6 +1109,14 @@ pub(crate) fn parse_timestamp(timestamp: &str) -> Result<DateTime<Utc>, StoreErr
 ///
 /// An in-memory database cannot, and says so by reporting "memory"; that is not
 /// a failure, just a database this does not apply to.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 fn journal_mode_is_wal(connection: &Connection) -> Result<bool, StoreError> {
     let mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
@@ -1498,6 +1520,42 @@ mod tests {
         let (run, events) = complex_run(run_value, config_id, event_base);
         store.create_run(&run, &config, &events).unwrap();
         (run, events, config)
+    }
+
+    /// Several processes open a fresh database at once: the control room, a
+    /// run, the 3D view. Every open must succeed and leave the schema current;
+    /// a step applied twice used to fail on a table that already existed.
+    #[test]
+    fn concurrent_first_opens_all_succeed_and_migrate_once() {
+        for _ in 0..20 {
+            let temp = TempDir::new().unwrap();
+            let path = database(&temp);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let opens: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SqliteStore::open(&path).map(|store| store.schema_version())
+                    })
+                })
+                .collect();
+            for open in opens {
+                let version = open
+                    .join()
+                    .unwrap()
+                    .expect("a concurrent first open failed");
+                assert_eq!(version.unwrap(), migrations::DATABASE_SCHEMA_VERSION);
+            }
+            // And the database is sound for whoever opens it next.
+            let later = SqliteStore::open(&path).unwrap();
+            assert_eq!(
+                later.schema_version().unwrap(),
+                migrations::DATABASE_SCHEMA_VERSION
+            );
+        }
     }
 
     #[test]

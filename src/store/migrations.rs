@@ -23,21 +23,63 @@ const MIGRATIONS: [Migration; DATABASE_SCHEMA_VERSION as usize] = [
     migrate_v12,
 ];
 
+/// Brings the database up to [`DATABASE_SCHEMA_VERSION`], one step per
+/// write transaction.
+///
+/// Several processes can open a fresh database at once (the control room,
+/// a run, the 3D view). The version is therefore read *inside* the write
+/// lock that applies the step: a process that read it outside could apply a
+/// step another process had already committed, fail on a table that already
+/// exists, and leave every later open failing the same way. An up-to-date
+/// database, the everyday case, is recognised without taking the lock.
 pub(crate) fn migrate(connection: &Connection) -> Result<(), StoreError> {
-    let version =
-        connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
+    if schema_version(connection)? == DATABASE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    loop {
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let applied = apply_next_step(connection);
+        match applied {
+            Ok(true) => connection.execute_batch("COMMIT")?,
+            Ok(false) => {
+                connection.execute_batch("COMMIT")?;
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn schema_version(connection: &Connection) -> Result<u32, StoreError> {
+    Ok(connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?)
+}
+
+/// Applies the step after the version read under the caller's write lock;
+/// `false` when there is none left.
+fn apply_next_step(connection: &Connection) -> Result<bool, StoreError> {
+    // Touch the schema first. A connection that opened while another was
+    // mid-migration still holds the schema it saw then, and some statements
+    // (`ALTER TABLE ... RENAME COLUMN`) check columns against that stale copy
+    // before SQLite notices the change. Reading `sqlite_master` under the
+    // write lock makes it reload.
+    connection.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+    let version = schema_version(connection)?;
     if version > DATABASE_SCHEMA_VERSION {
         return Err(StoreError::UnsupportedDatabaseVersion(version));
     }
-    for step in &MIGRATIONS[version as usize..] {
-        step(connection)?;
-    }
-    Ok(())
+    let Some(step) = MIGRATIONS.get(version as usize) else {
+        return Ok(false);
+    };
+    step(connection)?;
+    Ok(true)
 }
 
 fn migrate_v1(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-                "BEGIN IMMEDIATE;
+                "
                  CREATE TABLE config_snapshots (
                      id TEXT PRIMARY KEY NOT NULL,
                      schema_version INTEGER NOT NULL CHECK (schema_version > 0),
@@ -81,15 +123,14 @@ fn migrate_v1(connection: &Connection) -> Result<(), StoreError> {
                  CREATE INDEX runs_status_updated_idx ON runs(status, updated_at DESC);
                  CREATE INDEX runs_config_snapshot_idx ON runs(config_snapshot_id);
                  CREATE INDEX events_run_occurred_idx ON events(run_id, occurred_at);
-                 PRAGMA user_version = 1;
-                 COMMIT;",
+                 PRAGMA user_version = 1;",
     )?;
     Ok(())
 }
 
 fn migrate_v2(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE run_workspaces (
              run_id TEXT PRIMARY KEY NOT NULL,
              source_repo_path TEXT NOT NULL,
@@ -131,15 +172,14 @@ fn migrate_v2(connection: &Connection) -> Result<(), StoreError> {
          CREATE INDEX run_workspaces_common_dir_idx ON run_workspaces(git_common_dir);
          CREATE INDEX run_apply_operations_status_idx
              ON run_apply_operations(status, updated_at);
-         PRAGMA user_version = 2;
-         COMMIT;",
+         PRAGMA user_version = 2;",
     )?;
     Ok(())
 }
 
 fn migrate_v3(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE run_inputs (
              run_id TEXT PRIMARY KEY NOT NULL,
              schema_version INTEGER NOT NULL CHECK (schema_version > 0),
@@ -157,15 +197,14 @@ fn migrate_v3(connection: &Connection) -> Result<(), StoreError> {
          BEGIN
              SELECT RAISE(ABORT, 'run inputs are immutable');
          END;
-         PRAGMA user_version = 3;
-         COMMIT;",
+         PRAGMA user_version = 3;",
     )?;
     Ok(())
 }
 
 fn migrate_v4(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE managed_processes (
              id TEXT PRIMARY KEY NOT NULL,
              run_id TEXT NOT NULL,
@@ -226,8 +265,7 @@ fn migrate_v4(connection: &Connection) -> Result<(), StoreError> {
              ON managed_processes(run_id, status, updated_at);
          CREATE INDEX managed_processes_session_idx
              ON managed_processes(backend_session_id);
-         PRAGMA user_version = 4;
-         COMMIT;",
+         PRAGMA user_version = 4;",
     )?;
     Ok(())
 }
@@ -238,7 +276,7 @@ fn migrate_v4(connection: &Connection) -> Result<(), StoreError> {
 )]
 fn migrate_v5(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          DROP INDEX managed_processes_run_status_idx;
          DROP INDEX managed_processes_session_idx;
          DROP TRIGGER managed_processes_identity_immutable;
@@ -407,8 +445,7 @@ fn migrate_v5(connection: &Connection) -> Result<(), StoreError> {
          BEGIN
              SELECT RAISE(ABORT, 'artifacts are immutable');
          END;
-         PRAGMA user_version = 5;
-         COMMIT;",
+         PRAGMA user_version = 5;",
     )?;
     Ok(())
 }
@@ -418,10 +455,9 @@ fn migrate_v5(connection: &Connection) -> Result<(), StoreError> {
 /// lifecycle state, so it lives beside the snapshot rather than in it.
 fn migrate_v6(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          ALTER TABLE runs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1));
-         PRAGMA user_version = 6;
-         COMMIT;",
+         PRAGMA user_version = 6;",
     )?;
     Ok(())
 }
@@ -432,7 +468,7 @@ fn migrate_v6(connection: &Connection) -> Result<(), StoreError> {
 /// artifacts; the PNG itself is an ordinary worktree file.
 fn migrate_v7(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE image_generations (
              id TEXT PRIMARY KEY NOT NULL,
              run_id TEXT NOT NULL,
@@ -462,8 +498,7 @@ fn migrate_v7(connection: &Connection) -> Result<(), StoreError> {
          BEGIN
              SELECT RAISE(ABORT, 'image generations are immutable');
          END;
-         PRAGMA user_version = 7;
-         COMMIT;",
+         PRAGMA user_version = 7;",
     )?;
     Ok(())
 }
@@ -484,13 +519,12 @@ fn migrate_v7(connection: &Connection) -> Result<(), StoreError> {
 /// impossible, because nothing but the purge deletes rows at all.
 fn migrate_v8(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          ALTER TABLE runs RENAME COLUMN hidden TO archived;
          DROP TRIGGER artifacts_no_delete;
          DROP TRIGGER run_inputs_no_delete;
          DROP TRIGGER image_generations_no_delete;
-         PRAGMA user_version = 8;
-         COMMIT;",
+         PRAGMA user_version = 8;",
     )?;
     Ok(())
 }
@@ -504,10 +538,9 @@ fn migrate_v8(connection: &Connection) -> Result<(), StoreError> {
 /// run. Existing runs default to off — nobody is opted in by upgrading.
 fn migrate_v9(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          ALTER TABLE runs ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0;
-         PRAGMA user_version = 9;
-         COMMIT;",
+         PRAGMA user_version = 9;",
     )?;
     Ok(())
 }
@@ -523,7 +556,7 @@ fn migrate_v9(connection: &Connection) -> Result<(), StoreError> {
 /// existed.
 fn migrate_v10(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE missions (
              id TEXT PRIMARY KEY,
              status TEXT NOT NULL,
@@ -574,8 +607,7 @@ fn migrate_v10(connection: &Connection) -> Result<(), StoreError> {
          END;
          CREATE INDEX missions_status_updated_idx ON missions(status, updated_at DESC);
          CREATE INDEX mission_runs_mission_idx ON mission_runs(mission_id, package_id);
-         PRAGMA user_version = 10;
-         COMMIT;",
+         PRAGMA user_version = 10;",
     )?;
     Ok(())
 }
@@ -589,7 +621,7 @@ fn migrate_v10(connection: &Connection) -> Result<(), StoreError> {
 /// holds. Insert-only, one per run; a run attached by hand has none.
 fn migrate_v11(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE mission_handoffs (
              run_id TEXT PRIMARY KEY,
              mission_id TEXT NOT NULL,
@@ -609,8 +641,7 @@ fn migrate_v11(connection: &Connection) -> Result<(), StoreError> {
              SELECT RAISE(ABORT, 'mission handoffs are immutable');
          END;
          CREATE INDEX mission_handoffs_mission_idx ON mission_handoffs(mission_id, package_id);
-         PRAGMA user_version = 11;
-         COMMIT;",
+         PRAGMA user_version = 11;",
     )?;
     Ok(())
 }
@@ -620,7 +651,7 @@ fn migrate_v11(connection: &Connection) -> Result<(), StoreError> {
 /// while the row stands, for the same reason as a package run.
 fn migrate_v12(connection: &Connection) -> Result<(), StoreError> {
     connection.execute_batch(
-        "BEGIN IMMEDIATE;
+        "
          CREATE TABLE mission_leads (
              run_id TEXT PRIMARY KEY,
              mission_id TEXT NOT NULL,
@@ -634,8 +665,7 @@ fn migrate_v12(connection: &Connection) -> Result<(), StoreError> {
              SELECT RAISE(ABORT, 'mission lead bindings are immutable');
          END;
          CREATE INDEX mission_leads_mission_idx ON mission_leads(mission_id, created_at);
-         PRAGMA user_version = 12;
-         COMMIT;",
+         PRAGMA user_version = 12;",
     )?;
     Ok(())
 }
