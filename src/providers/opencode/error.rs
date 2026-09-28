@@ -44,6 +44,10 @@ pub enum OpencodeProviderError {
          navigation evidence; opencode has no verified stdin or file alternative for a stage prompt"
     )]
     PromptTooLarge(usize),
+    #[error("{0}")]
+    UnsafePermission(String),
+    #[error("opencode attention response cannot be empty")]
+    EmptyAttentionResponse,
     #[error(transparent)]
     ChangeHandoff(#[from] crate::providers::change_handoff::ChangeHandoffError),
     #[error(transparent)]

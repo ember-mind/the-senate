@@ -488,6 +488,7 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         std::fs::write("hello.txt", "created by fake opencode\n")?;
         std::fs::write("README.md", "fixture changed by fake opencode\n")?;
     }
+    let is_resume = resumed_session.is_some();
     let session_id = resumed_session.unwrap_or_else(|| format!("ses_{stage}"));
 
     if std::env::var_os("SENATE_FAKE_OPENCODE_ERROR").is_some() {
@@ -503,6 +504,56 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         return Ok(());
     }
 
+    // Shape copied from a real end-to-end run: opencode auto-rejects a `bash`
+    // call it cannot interactively ask about and ends the whole invocation
+    // right there — a clean `exit 0` whose last record is `step_finish`
+    // reason `"tool-calls"`, never `"stop"`. Only the first invocation halts;
+    // a `-s`/`--session` resume (an approval or a decline) completes
+    // normally, since the fixture has nothing further to react to.
+    if std::env::var_os("SENATE_FAKE_OPENCODE_PERMISSION_HALT").is_some() && !is_resume {
+        let message_id = format!("msg_{stage}");
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "type":"step_start",
+                "sessionID":session_id,
+                "part":{"messageID":message_id}
+            })
+        )?;
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "type":"tool_use",
+                "sessionID":session_id,
+                "part":{
+                    "tool":"bash",
+                    "callID":"call_1",
+                    "state":{
+                        "status":"error",
+                        "input":{"command":"python3 -c \"from calc import add; print(add(2,3))\""},
+                        "error":"The user rejected permission to use this specific tool call."
+                    }
+                }
+            })
+        )?;
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "type":"step_finish",
+                "sessionID":session_id,
+                "part":{
+                    "messageID":message_id,
+                    "reason":"tool-calls",
+                    "tokens":{"total":50,"input":40,"output":10}
+                }
+            })
+        )?;
+        return Ok(());
+    }
+
     let message_id = format!("msg_{stage}");
     writeln!(
         std::io::stdout(),
@@ -513,23 +564,6 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
             "part":{"messageID":message_id}
         })
     )?;
-    if std::env::var_os("SENATE_FAKE_OPENCODE_DENY_BASH").is_some() {
-        writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::json!({
-                "type":"tool_use",
-                "sessionID":session_id,
-                "part":{
-                    "tool":"bash",
-                    "state":{
-                        "status":"error",
-                        "error":"The user rejected permission to use this specific tool call."
-                    }
-                }
-            })
-        )?;
-    }
     writeln!(
         std::io::stdout(),
         "{}",

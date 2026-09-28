@@ -3,13 +3,13 @@
 Decide which native coding runtime, and optionally which model, executes each engineering role of a run, once, at creation.
 
 ## Sub-features
-- uniform: `--provider claude|codex|fake` maps every role in the workflow to that provider.
+- uniform: `--provider claude|codex|opencode|fake` maps every role in the workflow to that provider. `--provider opencode` requires `--model <provider/model>` (`ExecutionSelection::UniformWithModel`); opencode is explicit-only and never `recommended`'s choice.
 - recommended: `--profile recommended` (the default when neither flag is given) resolves the current versioned profile, `recommended_v3`, and persists explicit per-role routes plus a requested effort per role (see observability-and-effort.md).
 - frozen: runs persisted under `recommended_v1` or `recommended_v2` keep decoding their original routes and native-default effort.
 - models: configured model is null unless the immutable config supplies one; confirmed model comes only from provider evidence.
 - status: `status` prints the Routing table (role, configured provider, configured model, reason) and per-stage configured vs actual.
 - verifier: `Role::Verifier` always resolves to provider `verify` inside the router (`VERIFY_PROVIDER_ID`); it is never written to a snapshot, never in the Routing table, never in a profile or the resource plan.
-- retry-override: `retry <run-id> <stage-id> --provider claude|codex|fake [--model <id>]` sends one failed stage to another provider before retrying it. Only that stage moves; the snapshot, the Routing table and every other stage (the descendants the retry un-skips included) keep their routes. The override is stage state: it is recorded as a `StageRouteOverridden` event with reason `operator_override`, persisted in the run snapshot (v3), and it sticks, so a later plain retry of the same stage runs on the override, not on the route that failed. Without `--model` the provider's native default applies, never the model the snapshot pinned for the original route.
+- retry-override: `retry <run-id> <stage-id> --provider claude|codex|opencode|fake [--model <id>]` sends one failed stage to another provider before retrying it. Only that stage moves; the snapshot, the Routing table and every other stage (the descendants the retry un-skips included) keep their routes. The override is stage state: it is recorded as a `StageRouteOverridden` event with reason `operator_override`, persisted in the run snapshot (v3), and it sticks, so a later plain retry of the same stage runs on the override, not on the route that failed. Without `--model` the provider's native default applies, never the model the snapshot pinned for the original route.
 - model-fallback: when Codex refuses the model a stage ran on (`... model is not supported when using Codex with a ChatGPT account`, usually a `model = ...` in `~/.codex/config.toml` the account is not entitled to), `status` prints `try: senate retry <run-id> <stage-id> --provider codex --model gpt-5.6-luna` under the reason, and the TUI `t` chooser adds a `Codex on gpt-5.6-luna` row and opens on it. It is an ordinary `retry-override`; The Senate never edits the Codex config. The model is `CODEX_FALLBACK_MODEL` in `src/app/query.rs`, detection is `StageSummary::model_fallback`.
 
 ## How to get to it (user POV)
@@ -23,6 +23,7 @@ senate standard "<task>"                          # recommended_v3
 senate standard "<task>" --profile recommended
 senate standard "<task>" --provider claude
 senate standard "<task>" --provider codex
+senate standard "<task>" --provider opencode --model opencode-go/deepseek-v4-pro  # --model required for opencode
 senate standard "<task>" --provider fake
 senate status <run-id>
 senate retry <run-id> <stage-id> --provider claude            # this stage only, native default model
@@ -50,5 +51,6 @@ Current `recommended_v3` map with both providers ready (routes inherited unchang
 - `recommended_v2` evidence is runtime-level (role_core_v3, 3 repetitions) and was taken at native-default effort; it encodes no cost or token claims. `recommended_v3` restates every route as `Inherited` for that reason, and every effort row is `Provisional` (benchmark kind `expert_provisional`) until an effort sweep with `eval run --effort` replaces it.
 - The fallback row is withheld when the stage already ran on `CODEX_FALLBACK_MODEL`, so a refused fallback does not loop; bump the constant when ChatGPT's Codex line moves.
 - Codex never confirms its model; `actual` model stays `unconfirmed` for Codex stages by design.
+- `--provider opencode` without `--model` is refused before any state is created (`AppError::OpencodeModelRequired`); unlike Claude/Codex, opencode has no single native default across the vendors its model id can name.
 - Effort never changes routing; see observability-and-effort.md.
 - The verifier's stage line in `status` shows configured provider `verify` although the Routing table above it has no such row; that is the implicit route, not a missing one. Snapshots sealed before the verifier existed load unchanged and can still grow fix cycles.

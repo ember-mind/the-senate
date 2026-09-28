@@ -62,11 +62,12 @@ fn native_opencode_fixture_runs_through_tmux_preserves_source_then_applies() {
     );
 }
 
-/// opencode's model carries the vendor, so `--provider opencode` without
-/// `--model` sends only `--dir`/`--format json` — no `-m` flag at all — and
-/// the run still completes on whatever opencode's own CLI would default to.
+/// opencode's model carries the vendor, and it has no single native default
+/// across them, so `--provider opencode` without `--model` is refused at run
+/// creation — before any state exists or any process launches — rather than
+/// silently running on whatever opencode's own CLI happens to default to.
 #[test]
-fn opencode_without_an_explicit_model_omits_the_m_flag() {
+fn opencode_without_an_explicit_model_fails_fast_before_any_state_exists() {
     let fixture = Fixture::new();
     let started = fixture.senate(
         &[
@@ -80,9 +81,24 @@ fn opencode_without_an_explicit_model_omits_the_m_flag() {
         false,
         false,
     );
-    assert_success(&started);
-    let argv = fs::read_to_string(fixture.capture.join("implementation.argv")).unwrap();
-    assert!(!argv.lines().any(|line| line == "-m"), "{argv}");
+    assert!(
+        !started.status.success(),
+        "--provider opencode without --model must be refused: {}",
+        String::from_utf8_lossy(&started.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&started.stderr).contains("requires an explicit model"),
+        "stderr: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        !fixture.capture.join("implementation.argv").exists(),
+        "no process may launch when the model is missing"
+    );
+    assert!(
+        !fixture.data.join("runs").exists(),
+        "no run state may be created when the model is missing"
+    );
 }
 
 /// An unauthenticated opencode installation refuses the run before any state
@@ -99,6 +115,8 @@ fn unauthenticated_opencode_refuses_to_start() {
             fixture.repo.to_str().unwrap(),
             "--provider",
             "opencode",
+            "--model",
+            "opencode-go/deepseek-v4-pro",
         ],
         false,
         true,
@@ -152,12 +170,14 @@ fn an_unlisted_model_refuses_to_start_before_launching() {
     );
 }
 
-/// Headless opencode auto-rejects a permission it cannot ask about. The
-/// denial becomes visible progress in `status`, and the run still completes:
-/// no typed continuable permission request is fabricated for a protocol that
-/// offers no safe way to resume with broadened scope.
+/// End-to-end permission halt: opencode auto-rejects a `bash` call and ends
+/// the invocation (real shape, verified by hand); the run stops on typed
+/// `needs_user` attention naming the exact command; `senate resolve` (approve,
+/// no `--response`) resumes the same native session with `--session <id>` and
+/// a regenerated config that allows exactly that command, and the run
+/// completes.
 #[test]
-fn a_denied_bash_permission_is_visible_and_the_run_still_completes() {
+fn a_permission_halt_resolves_and_resumes_with_the_exact_command_allowed() {
     let fixture = Fixture::new();
     let started = Command::new(env!("CARGO_BIN_EXE_senate"))
         .args([
@@ -167,21 +187,69 @@ fn a_denied_bash_permission_is_visible_and_the_run_still_completes() {
             fixture.repo.to_str().unwrap(),
             "--provider",
             "opencode",
+            "--model",
+            "opencode-go/deepseek-v4-pro",
         ])
         .env("PATH", &fixture.fake_bin)
         .env("SENATE_DATA_DIR", &fixture.data)
         .env("SENATE_FAKE_OPENCODE_CAPTURE_DIR", &fixture.capture)
-        .env("SENATE_FAKE_OPENCODE_DENY_BASH", "1")
+        .env("SENATE_FAKE_OPENCODE_PERMISSION_HALT", "1")
         .output()
         .unwrap();
     assert_success(&started);
     let stdout = String::from_utf8(started.stdout).unwrap();
-    assert!(stdout.contains("Status     completed"), "{stdout}");
-    // The denial is committed semantic history (`ProviderProgress`), printed
-    // as one of the run's own committed events, not a status-line field.
+    assert!(stdout.contains("Status     needs_user"), "{stdout}");
     assert!(
-        stdout.to_lowercase().contains("denied permission"),
-        "the denial must be visible: {stdout}"
+        stdout.contains("python3 -c") && stdout.to_lowercase().contains("denied permission"),
+        "{stdout}"
+    );
+    let run_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Run        "))
+        .unwrap()
+        .to_owned();
+    let attention_id = stdout
+        .lines()
+        .find_map(|line| {
+            let (id, rest) = line.split_once(" · ")?;
+            rest.contains("permission").then(|| id.to_owned())
+        })
+        .expect("a pending permission attention line");
+
+    let resolved = fixture.senate(&["resolve", &run_id, &attention_id], false, false);
+    assert_success(&resolved);
+    let resolved_stdout = String::from_utf8(resolved.stdout).unwrap();
+    assert!(
+        resolved_stdout.contains("Status     completed"),
+        "{resolved_stdout}"
+    );
+
+    // The continuation prompt (`prompt::continuation`) does not repeat the
+    // "Stage: <id>" line the initial prompt carries, so the fixture's own
+    // stage-name extraction falls back to "resumed" for it, same as Codex's
+    // fixture does for its own continuation prompt.
+    let resumed_argv = fs::read_to_string(fixture.capture.join("resumed.argv")).unwrap();
+    assert!(
+        resumed_argv.contains("--session"),
+        "resume must target the exact native session: {resumed_argv}"
+    );
+    let provider_output = fixture
+        .data
+        .join("runs")
+        .join(&run_id)
+        .join("provider-output")
+        .join("opencode");
+    let session_dir = fs::read_dir(&provider_output)
+        .unwrap()
+        .find_map(Result::ok)
+        .expect("one opencode provider session directory")
+        .path();
+    let config_path = session_dir.join("invocation-2.config.json");
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["permission"]["bash"]["python3 -c \"from calc import add; print(add(2,3))\""],
+        serde_json::json!("allow")
     );
 }
 
@@ -199,6 +267,8 @@ fn a_vendor_error_fails_the_stage() {
             fixture.repo.to_str().unwrap(),
             "--provider",
             "opencode",
+            "--model",
+            "opencode-go/deepseek-v4-pro",
         ])
         .env("PATH", &fixture.fake_bin)
         .env("SENATE_DATA_DIR", &fixture.data)

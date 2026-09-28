@@ -403,10 +403,11 @@ pub struct RunArgs {
     /// selection flag is given.
     #[arg(long, conflicts_with = "provider")]
     pub profile: Option<String>,
-    /// Explicit model for `--provider`, every role. Required in practice for
-    /// `--provider opencode`, whose model id carries the vendor (for example
-    /// `opencode-go/deepseek-v4-pro` or `google/gemini-2.5-pro`); omitted for
-    /// Claude or Codex means their own native default.
+    /// Explicit model for `--provider`, every role. Required for
+    /// `--provider opencode` (refused otherwise), whose model id carries the
+    /// vendor (for example `opencode-go/deepseek-v4-pro` or
+    /// `google/gemini-2.5-pro`); omitted for Claude or Codex means their own
+    /// native default.
     #[arg(long, requires = "provider")]
     pub model: Option<String>,
     /// Requested native-runtime effort. One level for every role

@@ -121,6 +121,13 @@ impl OpencodeSandbox {
 /// (`Edit`, `mcp__*`, or a shape this function does not recognize) is simply
 /// not a bash pattern and is skipped rather than guessed at.
 ///
+/// This inherits Claude's own baseline verbatim, `find *` and `sed *`/`awk *`
+/// included: `find -exec`/`-delete` and `awk`'s `system()` can in principle
+/// escape a command allowlist, but Claude's own baseline already accepts that
+/// same risk for the same reason (`Edit`/`Write` are already granted, so
+/// refusing the read-only-looking half of that risk protects nothing) — kept
+/// for parity rather than re-litigated here.
+///
 /// # Errors
 /// Returns whatever reading the repository's `[permissions]` table returns.
 pub(crate) fn bash_allow_patterns(
@@ -141,6 +148,36 @@ pub(crate) fn bash_allow_patterns(
         }
     }
     Ok(patterns)
+}
+
+/// The one exact bash-permission pattern that replays a denied command and
+/// nothing wider, or why it cannot be granted that way.
+///
+/// opencode's own bash-permission matcher reads every pattern as a glob, so a
+/// pattern equal to the denied command verbatim is only an exact replay when
+/// the command itself carries none of that glob's own special characters —
+/// `*`, `?`, or `[` in the command text would silently widen "grant this
+/// exact call" into "grant everything this also matches". This is the same
+/// fail-closed reasoning behind Claude's own `--allowedTools` rule-syntax
+/// refusal, adapted to opencode's simpler permission unit: opencode evaluates
+/// permission on its own already-atomic `bash` tool call, so — unlike
+/// Claude, which re-parses and splits a compound shell line itself — no
+/// compound-command splitting is needed here.
+///
+/// # Errors
+/// Returns the reason a command cannot be granted as one exact pattern: it is
+/// empty, or it carries a character opencode's matcher treats as a wildcard.
+pub(crate) fn exact_bash_pattern(command: &str) -> Result<String, String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("the denied command is empty".to_owned());
+    }
+    if let Some(character) = trimmed.chars().find(|character| "*?[".contains(*character)) {
+        return Err(format!(
+            "'{character}' is glob syntax and would grant more than this exact command: {trimmed}"
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 pub(crate) fn initial(
@@ -419,6 +456,25 @@ mod tests {
             patterns.get("cargo test *").map(String::as_str),
             Some("allow")
         );
+    }
+
+    /// Real end-to-end shape: the denied command from a run's own evidence.
+    #[test]
+    fn exact_bash_pattern_accepts_a_plain_command_verbatim() {
+        let command = "python3 -c \"from calc import add; assert add(2,3)==5; print('ok')\"";
+        assert_eq!(exact_bash_pattern(command).as_deref(), Ok(command));
+    }
+
+    #[test]
+    fn exact_bash_pattern_refuses_glob_syntax_that_would_widen_the_grant() {
+        for command in ["rm *.txt", "cat file?.log", "ls [ab]*"] {
+            assert!(
+                exact_bash_pattern(command).is_err(),
+                "{command} must be refused"
+            );
+        }
+        assert!(exact_bash_pattern("").is_err());
+        assert!(exact_bash_pattern("   ").is_err());
     }
 
     fn strings(argv: &[OsString]) -> Vec<String> {

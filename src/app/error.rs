@@ -109,6 +109,10 @@ pub enum AppError {
     #[error("unsupported provider {0:?}; supported providers: claude, codex, opencode, fake")]
     UnsupportedProvider(String),
     #[error(
+        "--provider opencode requires an explicit model, because opencode's whole point is picking a vendor by model id and it has no single native default across them; use --provider opencode --model <provider/model> (run `opencode models` to see every model this installation supports)"
+    )]
+    OpencodeModelRequired,
+    #[error(
         "image generation cannot be enabled: {0}. Install and authenticate the Codex CLI (`codex login`) and retry, or start without --allow-image-generation."
     )]
     ImageGenerationUnavailable(String),

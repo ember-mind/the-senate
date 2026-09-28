@@ -107,6 +107,41 @@ pub(crate) fn text_part(line: &[u8]) -> Option<(String, String)> {
     Some((message_id, text))
 }
 
+/// The exact command of one denied `bash` tool call, or `None` when this line
+/// is not one.
+///
+/// Deliberately separate from [`decode`], which turns a denial into a bounded
+/// progress description for the event log: recovering an exact permission
+/// grant needs the verbatim command opencode reported, not a shortened one.
+/// Scoped to `bash` specifically because it is the only tool this adapter's
+/// own generated permission config ever sets to `"ask"` (every other tool is
+/// flatly `"allow"` or `"deny"`); a flatly denied tool never produces this
+/// "auto-rejecting" shape and never halts the session the way an unresolved
+/// `ask` does.
+pub(crate) fn denied_bash(line: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("tool_use") {
+        return None;
+    }
+    let part = value.get("part")?;
+    if part.get("tool").and_then(Value::as_str) != Some("bash") {
+        return None;
+    }
+    let state = part.get("state")?;
+    if state.get("status").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let message = state.get("error").and_then(Value::as_str)?;
+    if !message.to_ascii_lowercase().contains("rejected permission") {
+        return None;
+    }
+    state
+        .get("input")?
+        .get("command")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
 fn decode(value: &Value) -> Result<OpencodeEvent, OpencodeProviderError> {
     let session_id = value
         .get("sessionID")
@@ -393,5 +428,27 @@ mod tests {
         let huge = "x".repeat(MAX_PROGRESS_CHARS + 500);
         let bounded_text = bounded(&huge);
         assert!(bounded_text.chars().count() <= MAX_PROGRESS_CHARS + 2);
+    }
+
+    /// Shape copied from a real end-to-end run's retained stdout: opencode
+    /// auto-rejects a bash call it cannot interactively ask about.
+    #[test]
+    fn denied_bash_extracts_the_exact_command() {
+        let raw = br#"{"type":"tool_use","sessionID":"ses_A","part":{"tool":"bash","callID":"call_1","state":{"status":"error","input":{"command":"python3 -c \"from calc import add; print(add(2,3))\""},"error":"The user rejected permission to use this specific tool call."}}}"#;
+        assert_eq!(
+            denied_bash(raw).as_deref(),
+            Some("python3 -c \"from calc import add; print(add(2,3))\"")
+        );
+    }
+
+    #[test]
+    fn denied_bash_ignores_everything_else() {
+        // Completed bash call: no denial.
+        let completed = br#"{"type":"tool_use","sessionID":"ses_A","part":{"tool":"bash","state":{"status":"completed","input":{"command":"ls"}}}}"#;
+        assert_eq!(denied_bash(completed), None);
+        // A flatly denied tool (external_directory) never uses this shape.
+        let other_tool = br#"{"type":"tool_use","sessionID":"ses_A","part":{"tool":"write","state":{"status":"error","input":{"filePath":"/x"},"error":"The user has specified a rule which prevents you from using this specific tool call."}}}"#;
+        assert_eq!(denied_bash(other_tool), None);
+        assert_eq!(denied_bash(b"not json"), None);
     }
 }

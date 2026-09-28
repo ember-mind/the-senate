@@ -15,22 +15,26 @@ mod protocol;
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read as _};
+use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    EffortSetting, ModelId, ProviderId, ProviderSessionId, Role, StageKind, StageStatus,
+    AttentionKind, AttentionRequestId, EffortSetting, ModelId, ProviderId, ProviderSessionId, Role,
+    StageKind, StageStatus,
 };
-use crate::engine::{Provider, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal};
+use crate::engine::{
+    Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
+    ProviderSignal,
+};
 use crate::process::{
     ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
     ProcessManager, TmuxBackend,
 };
 use crate::providers::{
-    ProviderCommit, ProviderSessionMutation, ProviderSessionRecord, ProviderSessionRecordId,
-    ProviderSessionStatus, change_handoff,
+    PendingProviderAttention, ProviderCommit, ProviderSessionMutation, ProviderSessionRecord,
+    ProviderSessionRecordId, ProviderSessionStatus, change_handoff,
 };
 use crate::store::{SqliteStore, process_root};
 
@@ -46,6 +50,14 @@ const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 /// Ceiling for one line held in memory while reconstructing the final
 /// answer. Generous against JSON escaping.
 const MAX_MESSAGE_LINE_BYTES: u64 = 8 * 1024 * 1024;
+/// Ceiling on the retained stdout scanned for a denied `bash` call when a
+/// clean exit never reached a terminal `stop` step. Mirrors Claude's own
+/// denial-recovery scan: an oversized log yields no evidence rather than
+/// being pulled fully into memory, which asks the operator instead of
+/// guessing.
+const MAX_DENIAL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+/// Ceiling on one persisted operator response to a permission attention.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct OpencodeProvider<B = TmuxBackend> {
     id: ProviderId,
@@ -194,6 +206,111 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         Ok(())
     }
 
+    /// The exact denied `bash` command a pending permission attention points
+    /// at, re-read from the retained stdout range [`PendingProviderAttention`]
+    /// bounds — the same seek-and-parse-one-record pattern Claude's own
+    /// denial recovery uses.
+    fn read_pending_denial(
+        store: &SqliteStore,
+        pending: &PendingProviderAttention,
+    ) -> Result<String, OpencodeProviderError> {
+        let process = store.load_managed_process(pending.process_id())?;
+        let mut file = File::open(process.spec().stdout_path())?;
+        file.seek(SeekFrom::Start(pending.record_start()))?;
+        let length = pending
+            .record_end()
+            .checked_sub(pending.record_start())
+            .ok_or_else(|| {
+                OpencodeProviderError::Protocol("attention range regression".to_owned())
+            })?;
+        let mut bytes = vec![
+            0_u8;
+            usize::try_from(length).map_err(
+                |_| OpencodeProviderError::Protocol("attention record too large".to_owned())
+            )?
+        ];
+        file.read_exact(&mut bytes)?;
+        protocol::denied_bash(&bytes).ok_or_else(|| {
+            OpencodeProviderError::Protocol(
+                "pending attention record is not a denied bash call".to_owned(),
+            )
+        })
+    }
+
+    fn response_path(
+        &self,
+        session_id: ProviderSessionRecordId,
+        attention_id: AttentionRequestId,
+    ) -> PathBuf {
+        self.artifact_root
+            .join("provider-responses")
+            .join(session_id.to_string())
+            .join(format!("{attention_id}.txt"))
+    }
+
+    fn read_response(
+        &self,
+        session_id: ProviderSessionRecordId,
+        attention_id: AttentionRequestId,
+    ) -> Result<Option<String>, OpencodeProviderError> {
+        match std::fs::read_to_string(self.response_path(session_id, attention_id)) {
+            Ok(response) => Ok(Some(response)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Persists the operator's decline instruction once. Absence of this file
+    /// at resume time is itself meaningful: it is how the adapter tells an
+    /// approval (no response ever staged) from a decline (one was).
+    fn write_response_once(
+        &self,
+        session_id: ProviderSessionRecordId,
+        attention_id: AttentionRequestId,
+        response: &str,
+    ) -> Result<(), OpencodeProviderError> {
+        use std::io::Write as _;
+
+        let bytes = response.as_bytes();
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(OpencodeProviderError::Protocol(format!(
+                "attention response exceeds {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        if response.trim().is_empty() {
+            return Err(OpencodeProviderError::EmptyAttentionResponse);
+        }
+        let path = self.response_path(session_id, attention_id);
+        let directory = path.parent().ok_or_else(|| {
+            OpencodeProviderError::Protocol("response path has no parent".to_owned())
+        })?;
+        std::fs::create_dir_all(directory)?;
+        if path.exists() {
+            return if std::fs::read(&path)? == bytes {
+                Ok(())
+            } else {
+                Err(OpencodeProviderError::ArtifactConflict(path))
+            };
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        temporary.write_all(bytes)?;
+        temporary.as_file().sync_all()?;
+        match temporary.persist_noclobber(&path) {
+            Ok(file) => file.sync_all()?,
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&path)? != bytes {
+                    return Err(OpencodeProviderError::ArtifactConflict(path));
+                }
+            }
+            Err(error) => return Err(error.error.into()),
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one function keeps orphan reuse, attention resolution, and command building together"
+    )]
     fn start_invocation(
         &mut self,
         store: &mut SqliteStore,
@@ -230,13 +347,41 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         }
 
         let config_path = self.config_path(request, &session, invocation);
-        let bash_allow = Self::bash_allow(store, request)?;
+        let mut bash_allow = Self::bash_allow(store, request)?;
+        // A pending permission attention resolves into this invocation's own
+        // command and config: an approval widens the allowlist by exactly the
+        // denied command and asks the agent to retry it; a decline grants
+        // nothing and carries the operator's instruction instead. Read before
+        // `bind_process` below, which clears it.
+        let attention_note = if let Some(pending) = session.pending_attention() {
+            let command = Self::read_pending_denial(store, pending)?;
+            match self.read_response(session.id(), pending.attention_id())? {
+                None => {
+                    let pattern = command::exact_bash_pattern(&command)
+                        .map_err(OpencodeProviderError::UnsafePermission)?;
+                    bash_allow.insert(pattern, "allow".to_owned());
+                    Some(format!(
+                        "The operator approved the command you were denied permission to run: `{command}`. It is now allowed; retry it, then continue the task."
+                    ))
+                }
+                Some(text) => Some(format!(
+                    "The operator declined the command you were denied permission to run: `{command}`. {text}"
+                )),
+            }
+        } else {
+            None
+        };
         Self::write_config(&config_path, request.stage_kind(), &bash_allow)?;
 
         let command = if let Some(native) = session.native_session_id() {
+            let mut prompt = prompt::continuation(request);
+            if let Some(note) = &attention_note {
+                prompt.push_str("\n\n");
+                prompt.push_str(note);
+            }
             command::resume(
                 native,
-                &prompt::continuation(request),
+                &prompt,
                 request.stage_kind(),
                 self.model.as_ref(),
                 self.effort,
@@ -289,15 +434,27 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         request: &ProviderRequest,
         session: ProviderSessionRecord,
     ) -> Result<ProviderPoll, OpencodeProviderError> {
-        if !request.observe_only()
-            && (session.status() == ProviderSessionStatus::Created
-                || (session.status() == ProviderSessionStatus::Interrupted
-                    && matches!(
-                        request.stage_status(),
-                        StageStatus::Ready | StageStatus::Running
-                    )))
-        {
-            return self.start_invocation(store, request, session);
+        if !request.observe_only() {
+            if session.status() == ProviderSessionStatus::Created {
+                return self.start_invocation(store, request, session);
+            }
+            // A permission halt (`NeedsUser`) and an interruption both resume
+            // by launching a fresh invocation once the stage is running
+            // again; a stage that never started keeps `Ready` while the
+            // session sits interrupted over a dead process, and that needs
+            // the same fresh launch.
+            if matches!(
+                session.status(),
+                ProviderSessionStatus::NeedsUser | ProviderSessionStatus::Interrupted
+            ) && request.stage_status() == StageStatus::Running
+            {
+                return self.start_invocation(store, request, session);
+            }
+            if session.status() == ProviderSessionStatus::Interrupted
+                && request.stage_status() == StageStatus::Ready
+            {
+                return self.start_invocation(store, request, session);
+            }
         }
         let Some(process_id) = session.current_process_id() else {
             if request.observe_only() {
@@ -316,6 +473,12 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             self.manager.start(store, process_id)?;
         }
         let inspection = self.manager.inspect(store, process_id)?;
+        let successful_exit = inspection.exit_evidence.as_ref().is_some_and(|evidence| {
+            matches!(
+                evidence.result(),
+                crate::process::ExitResult::ExitCode { code: 0 }
+            )
+        });
         let chunk = self.read_record_chunk(store, process_id)?;
         if let Some((event, consumed)) = first_record(chunk.bytes())? {
             let consumed = u64::try_from(consumed)
@@ -323,12 +486,6 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             let end = chunk.start_offset().checked_add(consumed).ok_or_else(|| {
                 OpencodeProviderError::Protocol("output offset overflow".to_owned())
             })?;
-            let successful_exit = inspection.exit_evidence.as_ref().is_some_and(|evidence| {
-                matches!(
-                    evidence.result(),
-                    crate::process::ExitResult::ExitCode { code: 0 }
-                )
-            });
             return self.map_record(
                 store,
                 request,
@@ -354,6 +511,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             session,
             chunk,
             inspection.process.status(),
+            successful_exit,
         )
     }
 
@@ -532,6 +690,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         mut session: ProviderSessionRecord,
         chunk: OutputChunk,
         status: ManagedProcessStatus,
+        successful_exit: bool,
     ) -> Result<ProviderPoll, OpencodeProviderError> {
         if session.native_session_id().is_none() && !request.observe_only() {
             if matches!(
@@ -551,6 +710,55 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         }
         let expected = session.revision();
         let end = chunk.end_offset();
+        // opencode ends the whole invocation — a clean `exit 0` — the moment a
+        // headless `ask` permission is auto-rejected, never reaching a
+        // terminal `stop` step (observed by hand, both in the spike fixtures
+        // and in a real end-to-end run: `impl.jsonl`/`impl.stderr.txt` and a
+        // process whose retained stream ends on `step_finish` reason
+        // `tool-calls`). That is a permission halt, not a crash: recover the
+        // exact denied command from the retained stream and raise typed
+        // attention, the same continuation shape Claude's own permission
+        // denials use. A clean exit with no `stop` step and no denial
+        // evidence at all is a distinct, unexplained ending and gets its own
+        // specific failure rather than the generic one below.
+        if status == ManagedProcessStatus::Exited && successful_exit {
+            if let Some(process_id) = session.current_process_id() {
+                let process = store.load_managed_process(process_id)?;
+                if let Some((command, start, denial_end)) =
+                    last_denied_bash(process.spec().stdout_path())
+                {
+                    let attention_id = AttentionRequestId::new();
+                    let pending =
+                        PendingProviderAttention::new(attention_id, process_id, start, denial_end)
+                            .map_err(|error| OpencodeProviderError::Protocol(error.to_owned()))?;
+                    session
+                        .need_user(pending, Self::now())
+                        .map_err(|error| OpencodeProviderError::Protocol(error.to_owned()))?;
+                    return Ok(ProviderPoll::Emission {
+                        signals: vec![ProviderSignal::NeedsUser {
+                            kind: AttentionKind::Permission,
+                            summary: format!(
+                                "opencode was denied permission to run `{command}` and stopped the turn; approve to allow it and retry, or decline to continue without it"
+                            ),
+                            request_id: Some(attention_id),
+                        }],
+                        commit: ProviderCommit::new(chunk, end)
+                            .with_session(ProviderSessionMutation::new(session, expected)),
+                    });
+                }
+            }
+            session
+                .fail(Self::now())
+                .map_err(|error| OpencodeProviderError::Protocol(error.to_owned()))?;
+            return Ok(ProviderPoll::Emission {
+                signals: vec![ProviderSignal::Failed(format!(
+                    "opencode exited cleanly without reaching a final step and without any observed permission denial for {}",
+                    request.stage_id()
+                ))],
+                commit: ProviderCommit::new(chunk, end)
+                    .with_session(ProviderSessionMutation::new(session, expected)),
+            });
+        }
         let signal = if matches!(
             status,
             ManagedProcessStatus::Interrupted | ManagedProcessStatus::Missing
@@ -587,6 +795,56 @@ impl<B: ProcessBackend> Provider for OpencodeProvider<B> {
 
     fn keep_attached_for(&self, _request: &ProviderRequest) -> Result<bool, ProviderError> {
         Ok(true)
+    }
+
+    /// Stages the operator's decision on one permission halt before the
+    /// domain commits the resolution: `response: None` is "omit to approve"
+    /// (see `senate resolve`), anything else is a decline carrying that text
+    /// as the continuation instruction. Approval is validated as an exact,
+    /// non-widening grant *before* anything commits — the same
+    /// prove-it-first discipline Claude's own permission continuation uses —
+    /// so an ungrantable command (glob syntax in the denied line itself) is
+    /// refused to the operator instead of committing a resolution every
+    /// later drive would fail to build a command for.
+    fn stage_attention_response(
+        &mut self,
+        store: &mut SqliteStore,
+        context: &ProviderAttentionContext,
+        response: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let result = (|| -> Result<(), OpencodeProviderError> {
+            let session = store
+                .list_provider_sessions(context.run_id())?
+                .into_iter()
+                .find(|session| {
+                    session.stage_id() == context.stage_id()
+                        && session.provider_id() == &self.id
+                        && session
+                            .pending_attention()
+                            .is_some_and(|pending| pending.attention_id() == context.request_id())
+                })
+                .ok_or_else(|| {
+                    OpencodeProviderError::Protocol(
+                        "attention has no matching opencode provider session".to_owned(),
+                    )
+                })?;
+            let pending = session
+                .pending_attention()
+                .expect("matched pending attention");
+            let command = Self::read_pending_denial(store, pending)?;
+            match response {
+                None => {
+                    command::exact_bash_pattern(&command)
+                        .map_err(OpencodeProviderError::UnsafePermission)?;
+                }
+                Some(text) if !text.trim().is_empty() => {
+                    self.write_response_once(session.id(), context.request_id(), text)?;
+                }
+                Some(_) => return Err(OpencodeProviderError::EmptyAttentionResponse),
+            }
+            Ok(())
+        })();
+        result.map_err(|error| ProviderError::new(error.to_string()))
     }
 
     fn stage_continue_instruction(
@@ -709,6 +967,42 @@ fn read_capped_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::R
     Ok(read)
 }
 
+/// The last denied `bash` call retained in `path`, with its own exact byte
+/// range, or `None` when no denial is evidenced there.
+///
+/// Read-only and bounded: an oversized log yields no evidence rather than
+/// being pulled fully into memory, the same "unreadable/oversized log asks
+/// the operator" rule Claude's own denial-recovery scan already uses. The
+/// range is the *last* denial specifically, mirroring what actually happens:
+/// once opencode auto-rejects one `ask` request it stops the whole
+/// invocation, so at most one such record exists per invocation in practice,
+/// and taking the last one is simply the most defensive reading of that.
+fn last_denied_bash(path: &Path) -> Option<(String, u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_DENIAL_SCAN_BYTES {
+        return None;
+    }
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let mut line = Vec::new();
+    let mut position = 0_u64;
+    let mut last = None;
+    loop {
+        line.clear();
+        let start = position;
+        let read = read_capped_line(&mut reader, &mut line).ok()?;
+        if read == 0 {
+            break;
+        }
+        position = position.saturating_add(read);
+        if line.last() == Some(&b'\n')
+            && let Some(command) = protocol::denied_bash(&line)
+        {
+            last = Some((command, start, position));
+        }
+    }
+    last
+}
+
 fn create_private_parent(path: &Path) -> Result<(), OpencodeProviderError> {
     let parent = path
         .parent()
@@ -769,14 +1063,27 @@ mod tests {
         "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"stop\",\"tokens\":{\"total\":167,\"input\":100,\"output\":47,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":20}}}}\n"
     );
 
-    /// Shape copied from the real `impl.jsonl`/`impl.stderr.txt` fixture: a
-    /// bash call auto-rejected mid-turn, the agent continues, and the turn
-    /// still ends in `stop`.
-    const DENIED_PERMISSION_OUTPUT: &str = concat!(
+    /// Shape copied from a real end-to-end run (`stdout.log`/`stderr.log`,
+    /// path-sanitized): opencode auto-rejects a `bash` call the headless
+    /// session cannot interactively ask about and ends the *whole
+    /// invocation* right there — a clean `exit 0` whose last record is
+    /// `step_finish` reason `"tool-calls"`, never `"stop"`. The spike's own
+    /// `impl.jsonl`/`impl.stderr.txt` and `resume.jsonl` show the same shape:
+    /// the denial ends one invocation, and a later `-s <session>` resume is
+    /// what continues it to `"stop"`.
+    const PERMISSION_HALT_OUTPUT: &str = concat!(
         "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\"}}\n",
-        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"state\":{\"status\":\"error\",\"error\":\"The user rejected permission to use this specific tool call.\"}}}\n",
-        "{\"type\":\"text\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"text\":\"Done without network access.\"}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"stop\",\"tokens\":{\"total\":50,\"input\":40,\"output\":10}}}\n"
+        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_1\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"python3 -c \\\"from calc import add; assert add(2,3)==5\\\"\"},\"error\":\"The user rejected permission to use this specific tool call.\"}}}\n",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"tool-calls\",\"tokens\":{\"total\":50,\"input\":40,\"output\":10}}}\n"
+    );
+
+    /// What a `-s ses_A` resume looks like once the operator approves the
+    /// denied command: the agent retries it and this time reaches `"stop"`.
+    const RESUME_AFTER_APPROVAL_OUTPUT: &str = concat!(
+        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\"}}\n",
+        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_2\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"python3 -c \\\"from calc import add; assert add(2,3)==5\\\"\"},\"output\":\"\"}}}\n",
+        "{\"type\":\"text\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"text\":\"# opencode result\\nVerified.\"}}\n",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"reason\":\"stop\",\"tokens\":{\"total\":30,\"input\":20,\"output\":10}}}\n"
     );
 
     /// Shape copied from the real `err-402.jsonl` fixture.
@@ -909,6 +1216,135 @@ mod tests {
         }
     }
 
+    /// One recorded invocation's number and exact argv.
+    type RecordedInvocation = (u32, Vec<String>);
+
+    /// Invocation 1 replays a real permission halt; invocation 2+ replays
+    /// what a `-s ses_A` resume looks like once approved. Records every
+    /// invocation's exact argv, so a test can check the resume actually
+    /// carries `--session ses_A`.
+    #[derive(Clone, Default)]
+    struct HaltThenResumeBackend {
+        started: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
+        completed: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
+        invocations: Arc<Mutex<Vec<RecordedInvocation>>>,
+    }
+
+    impl ProcessBackend for HaltThenResumeBackend {
+        fn kind(&self) -> &'static str {
+            "halt_then_resume"
+        }
+
+        fn session_id(&self, process_id: crate::process::ManagedProcessId) -> BackendSessionId {
+            BackendSessionId::for_process(process_id)
+        }
+
+        fn availability(&self) -> Result<BackendAvailability, ProcessError> {
+            Ok(BackendAvailability {
+                kind: self.kind(),
+                version: "fixture-1".to_owned(),
+            })
+        }
+
+        fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
+            let argv = process
+                .spec()
+                .argv()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            self.invocations
+                .lock()
+                .unwrap()
+                .push((process.invocation(), argv));
+            let output = if process.invocation() == 1 {
+                PERMISSION_HALT_OUTPUT
+            } else {
+                RESUME_AFTER_APPROVAL_OUTPUT
+            };
+            std::fs::write(process.spec().stdout_path(), output)?;
+            self.started.lock().unwrap().insert(process.id());
+            Ok(())
+        }
+
+        fn inspect_session(
+            &self,
+            process: &ManagedProcess,
+        ) -> Result<BackendSessionState, ProcessError> {
+            if self.started.lock().unwrap().contains(&process.id()) {
+                self.completed.lock().unwrap().insert(process.id());
+            }
+            Ok(BackendSessionState::Absent)
+        }
+
+        fn read_output(
+            &self,
+            process: &ManagedProcess,
+            stream: OutputStream,
+            offset: u64,
+            max_bytes: usize,
+        ) -> Result<OutputChunk, ProcessError> {
+            let path = match stream {
+                OutputStream::Stdout => process.spec().stdout_path(),
+                OutputStream::Stderr => process.spec().stderr_path(),
+            };
+            let mut file = File::open(path)?;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            let mut bytes = Vec::new();
+            file.take(u64::try_from(max_bytes).unwrap())
+                .read_to_end(&mut bytes)?;
+            OutputChunk::new(
+                process.id(),
+                stream,
+                process.cursor(stream).revision(),
+                offset,
+                bytes,
+            )
+        }
+
+        fn output_length(
+            &self,
+            process: &ManagedProcess,
+            stream: OutputStream,
+        ) -> Result<u64, ProcessError> {
+            let path = match stream {
+                OutputStream::Stdout => process.spec().stdout_path(),
+                OutputStream::Stderr => process.spec().stderr_path(),
+            };
+            Ok(std::fs::metadata(path)?.len())
+        }
+
+        fn read_exit_evidence(
+            &self,
+            process: &ManagedProcess,
+        ) -> Result<Option<ExitEvidence>, ProcessError> {
+            if !self.completed.lock().unwrap().contains(&process.id()) {
+                return Ok(None);
+            }
+            let now = OpencodeProvider::<Self>::now();
+            Ok(Some(ExitEvidence::new(
+                process.id(),
+                process.command_fingerprint().to_owned(),
+                ExitResult::ExitCode { code: 0 },
+                false,
+                now,
+                now,
+            )))
+        }
+
+        fn signal(
+            &self,
+            _process: &ManagedProcess,
+            _signal: TerminationSignal,
+        ) -> Result<(), ProcessError> {
+            Ok(())
+        }
+
+        fn cleanup(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
+            Ok(())
+        }
+    }
+
     fn fixture(
         output: &str,
     ) -> (
@@ -921,14 +1357,14 @@ mod tests {
         fixture_with(FixtureBackend::new(output))
     }
 
-    fn fixture_with(
-        backend: FixtureBackend,
+    fn fixture_with<B: ProcessBackend>(
+        backend: B,
     ) -> (
         TempDir,
         PathBuf,
         crate::domain::RunId,
         SqliteStore,
-        OpencodeProvider<FixtureBackend>,
+        OpencodeProvider<B>,
     ) {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("source");
@@ -936,7 +1372,7 @@ mod tests {
         let database = temp.path().join("senate.db");
         let process_root = temp.path().join("runs");
         let run_id = crate::domain::RunId::new();
-        let created_at = OpencodeProvider::<FixtureBackend>::now();
+        let created_at = OpencodeProvider::<B>::now();
         let config_id = ConfigSnapshotId::new(format!("opencode-{run_id}")).unwrap();
         let run = Run::new(run_id, implementation_only(), config_id.clone(), created_at);
         let input = RunInput::new(run_id, "fixture task", created_at).unwrap();
@@ -1005,8 +1441,8 @@ mod tests {
         );
     }
 
-    fn drive_to_completion(
-        engine: &mut WorkflowEngine<OpencodeProvider<FixtureBackend>>,
+    fn drive_to_completion<B: ProcessBackend>(
+        engine: &mut WorkflowEngine<OpencodeProvider<B>>,
         store: &mut SqliteStore,
         run_id: crate::domain::RunId,
     ) -> RunStatus {
@@ -1096,34 +1532,127 @@ mod tests {
         );
     }
 
-    /// Headless opencode auto-rejects a permission it cannot ask about; the
-    /// denial becomes visible progress and the run still completes — the
-    /// same posture Codex's undecided-attention stance takes: no typed
-    /// continuable permission request is fabricated for a protocol that
-    /// offers no safe way to resume with broadened scope.
+    /// Headless opencode auto-rejects a permission it cannot ask about and
+    /// ends the whole invocation right there (verified against a real
+    /// end-to-end run) — a permission halt, not silent progress. It raises
+    /// the same typed continuable attention Claude's own permission denials
+    /// do; approving it resumes the same native session with the exact
+    /// command now allowed, and the run completes.
     #[test]
-    fn a_denied_permission_is_progress_and_the_run_still_completes() {
-        let (_temp, _database, run_id, mut store, provider) = fixture(DENIED_PERMISSION_OUTPUT);
-        let mut engine = WorkflowEngine::new(provider, "fixture task");
+    fn a_permission_halt_raises_attention_and_approval_resumes_and_completes() {
+        let backend = HaltThenResumeBackend::default();
+        let inspector = backend.clone();
+        let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
+        let mut engine = WorkflowEngine::new(provider, "fix the bug");
+        let request_id = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+        assert_eq!(session.status(), ProviderSessionStatus::NeedsUser);
+        assert_eq!(session.native_session_id().unwrap().as_str(), "ses_A");
+
+        let loaded = store.load_run(run_id).unwrap();
+        let attention = loaded
+            .run
+            .attention_requests()
+            .iter()
+            .find(|request| request.id() == request_id)
+            .unwrap();
+        assert_eq!(attention.kind(), crate::domain::AttentionKind::Permission);
+        assert!(
+            attention.summary().contains("python3 -c"),
+            "{}",
+            attention.summary()
+        );
+
+        // Approve: omit a response, exactly like `senate resolve <run> <id>`.
+        engine
+            .resolve_attention_with_response(&mut store, run_id, request_id, None)
+            .unwrap();
         assert_eq!(
             drive_to_completion(&mut engine, &mut store, run_id),
             RunStatus::Completed
         );
-        let events = store.load_events(run_id).unwrap();
-        let denial_progress = events.iter().any(|event| {
-            matches!(
-                event.event.kind(),
-                DomainEventKind::ProviderProgress { message, .. }
-                    if message.contains("denied permission")
-            )
-        });
-        assert!(denial_progress, "the denial must be visible, not silent");
+
+        let invocations = inspector.invocations.lock().unwrap().clone();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].0, 1);
+        assert_eq!(invocations[1].0, 2);
         assert!(
-            events.iter().all(|event| !matches!(
-                event.event.kind(),
-                DomainEventKind::ProviderNeedsUser { .. }
-            )),
-            "opencode never fabricates a typed continuable permission request"
+            invocations[1]
+                .1
+                .windows(2)
+                .any(|pair| pair[0] == "--session" && pair[1] == "ses_A"),
+            "{:?}",
+            invocations[1].1
+        );
+
+        let config_path = temp
+            .path()
+            .join("runs")
+            .join(run_id.to_string())
+            .join("provider-output")
+            .join("opencode")
+            .join(session.id().to_string())
+            .join("invocation-2.config.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["permission"]["bash"]["python3 -c \"from calc import add; assert add(2,3)==5\""],
+            serde_json::json!("allow")
+        );
+    }
+
+    /// A decline carries the operator's text into the continuation instead
+    /// of granting anything, and the resumed config never allows the denied
+    /// command.
+    #[test]
+    fn a_declined_permission_halt_resumes_without_granting_anything() {
+        let backend = HaltThenResumeBackend::default();
+        let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
+        let mut engine = WorkflowEngine::new(provider, "fix the bug");
+        let request_id = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+
+        engine
+            .resolve_attention_with_response(
+                &mut store,
+                run_id,
+                request_id,
+                Some("Continue without running it."),
+            )
+            .unwrap();
+        // Drive far enough to observe the resumed invocation's own config;
+        // the fixture backend always replays a successful shape for
+        // invocation 2+, which is fine here since only the config matters.
+        drive_to_completion(&mut engine, &mut store, run_id);
+
+        let config_path = temp
+            .path()
+            .join("runs")
+            .join(run_id.to_string())
+            .join("provider-output")
+            .join("opencode")
+            .join(session.id().to_string())
+            .join("invocation-2.config.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["permission"]["bash"]
+                .get("python3 -c \"from calc import add; assert add(2,3)==5\""),
+            None,
+            "a decline must never widen the allowlist"
         );
     }
 

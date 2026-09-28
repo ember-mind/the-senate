@@ -833,6 +833,9 @@ impl ProviderFactory for RuntimeProviderFactory {
         created_at: DateTime<Utc>,
     ) -> Result<ResolvedConfigSnapshot, AppError> {
         let availability = match &selection {
+            ExecutionSelection::Uniform(UniformProvider::Opencode) => {
+                return Err(AppError::OpencodeModelRequired);
+            }
             ExecutionSelection::Uniform(provider)
             | ExecutionSelection::UniformWithModel(provider, _) => {
                 require_explicit_provider(*provider)?;
@@ -867,6 +870,9 @@ impl ProviderFactory for RuntimeProviderFactory {
                 .map_err(|error| AppError::ImageGenerationUnavailable(error.to_string()))?;
         }
         let availability = match &selection {
+            ExecutionSelection::Uniform(UniformProvider::Opencode) => {
+                return Err(AppError::OpencodeModelRequired);
+            }
             ExecutionSelection::Uniform(provider)
             | ExecutionSelection::UniformWithModel(provider, _) => {
                 require_explicit_provider(*provider)?;
