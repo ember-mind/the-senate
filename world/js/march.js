@@ -370,6 +370,8 @@ export class Cohort {
         this.t = 0;
       }
     } else if (this.phase === 'turn') {
+      // One frame to face home; stand through it, or there is no motion to play.
+      motion = 'stand';
       this.phase = 'home';
       this.s = 0;
     } else if (this.phase === 'home') {
