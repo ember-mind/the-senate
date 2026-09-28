@@ -64,6 +64,8 @@ body[data-mode="overview"] .walk-only, body[data-mode="walk"] .overview-only { d
 .label.place span { font: italic 12px var(--serif); color: #4d3f33; }
 body.far .label.agent span.d { display: none; }
 .label span.d { color: var(--ink-soft); font-size: 11px; }
+.label b i.m { font-style: normal; background: var(--m); color: #f7f0e2; padding: 1px 6px 0; border-radius: 4px; letter-spacing: 0.1em; }
+.label b i.m.on-light { color: #2a211b; box-shadow: inset 0 0 0 1px rgba(42,33,27,0.35); }
 .label.agent.needs span.s { color: var(--seal); font-weight: 600; }
 
 /* Side panel */

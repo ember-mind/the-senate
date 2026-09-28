@@ -8,6 +8,7 @@
 import * as THREE from '../vendor/three.module.min.js';
 import { CSS2DObject } from '../vendor/three.module.min.js';
 import { COHORT_TUNICS, MOTIONS, makeFigure } from './figures.js';
+import { modelChip, modelOf } from './models.js';
 import { LAYOUT } from './architecture.js';
 import { STATE_WORD } from './props.js';
 import { Cohort, Ripple } from './march.js';
@@ -246,7 +247,7 @@ export class Director {
   }
 
   spawnWorker(o, desk, slot) {
-    const tunic = COHORT_TUNICS[(o.cohort - 1 + COHORT_TUNICS.length) % COHORT_TUNICS.length];
+    const tunic = modelOf(o.worker)?.color || COHORT_TUNICS[(o.cohort - 1 + COHORT_TUNICS.length) % COHORT_TUNICS.length];
     const l = label('agent cohort', () => this.ui.openOrder(o.id));
     // Motion only for a real start: the legion is sent when its Order starts
     // working between two snapshots. On first load, or when the Order shows
@@ -296,10 +297,10 @@ export class Director {
   }
 
   dressDesk(desk, o, rec) {
-    const who = o.worker ? `${o.worker.provider}` : '';
+    const model = modelChip(modelOf(o.worker), escapeHtml);
     const act = o.state === 'blocked' ? 'Needs you' : o.state === 'failed' ? 'Failed' : o.state === 'in_review' ? 'With the Censor' : ACTIVITY_WORD[o.activity] || STATE_WORD[o.state];
     const dur = o.since && o.state === 'working' ? since(o.since, Date.parse(this.state.at) || Date.now()) : '';
-    rec.label.innerHTML = `<b>COHORT ${numeral(o.cohort)}</b><span class="t">${escapeHtml(o.title)}</span><span class="s">${act}</span><span class="d">${escapeHtml(who)}${who && dur ? ' · ' : ''}${dur}</span>`;
+    rec.label.innerHTML = `<b>COHORT ${numeral(o.cohort)}${model ? ` · ${model}` : ''}</b><span class="t">${escapeHtml(o.title)}</span><span class="s">${act}</span>${dur ? `<span class="d">${dur}</span>` : ''}`;
     rec.label.classList.toggle('needs', o.state === 'blocked' || o.state === 'failed');
     rec.label.classList.toggle('quiet', o.state === 'in_review');
     let screen = 'off';
@@ -345,11 +346,29 @@ export class Director {
       f.visible = !!reviewing;
     });
     this.censorMotion = reviewing ? 'examine' : 'still';
+    const reviewer = reviewing ? modelOf(c.reviewer) : null;
+    this.dressCensor(reviewer?.color || null);
+    const chip = modelChip(reviewer, escapeHtml);
     this.censorLabel.innerHTML = reviewing
-      ? `<b>CENSOR</b><span class="t">Independent review</span><span class="s">Reviewing · ${escapeHtml(o.title)}</span>`
+      ? `<b>CENSOR${chip ? ` · ${chip}` : ''}</b><span class="t">Independent review</span><span class="s">Reviewing · ${escapeHtml(o.title)}</span>`
       : '<b>CENSOR</b><span class="t">Independent review</span><span class="s">Nothing to review</span>';
     this.censorLabel.classList.toggle('quiet', !reviewing);
     void prev;
+  }
+
+  // A new reviewer means a new robe: the Censor is rebuilt in that model's
+  // colour where he sits, and keeps his label.
+  dressCensor(color) {
+    if ((this.censorColor || null) === color) return;
+    this.censorColor = color;
+    const old = this.censor;
+    const next = makeFigure('censor', { pose: 'sit', tunic: color || undefined });
+    next.position.copy(old.position);
+    next.rotation.copy(old.rotation);
+    old.children.filter((ch) => ch.isCSS2DObject).forEach((ch) => next.add(ch));
+    this.w.scene.remove(old);
+    this.w.scene.add(next);
+    this.censor = next;
   }
 
   // Sealed tablets waiting for integration stand in the rack by the board.

@@ -138,13 +138,17 @@ function arm(rig) {
   }
 }
 
-export function makeKayFigure(role, { pose = 'stand', tunic = '#b98a52', variant = 0, armed = false } = {}) {
+export function makeKayFigure(role, { pose = 'stand', tunic, variant = 0, armed = false } = {}) {
   let spec = ROLES[role];
+  // A role's main garment can take a model's colour; its trims stay.
+  if (spec && tunic) spec = { ...spec, rules: [{ ...spec.rules[0], to: tunic }, ...spec.rules.slice(1)] };
   if (!spec) {
-    // Cohort members alternate two bodies; the tunic colour carries the desk's
-    // hue, the standard and plaque carry identity.
-    const body = variant % 2 ? 'Rogue' : 'Barbarian';
-    spec = { body, rules: body === 'Rogue' ? [{ ...GREEN, to: tunic, lift: 1.15 }] : [{ ...BLUE, to: tunic, lift: 1.15 }] };
+    tunic = tunic || '#b98a52';
+    // Cohort members alternate two bodies whose cloaks both take the tunic
+    // colour, so every soldier shows the model it works for. The Barbarian
+    // body is left to the enemy: its grey cloak takes no colour.
+    const body = variant % 2 ? 'Rogue_Hooded' : 'Rogue';
+    spec = { body, rules: [{ ...GREEN, to: tunic, lift: 1.15 }] };
   }
   const src = KAY[spec.body];
   const model = SkeletonUtils.clone(src.scene);
