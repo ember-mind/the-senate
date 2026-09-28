@@ -407,6 +407,37 @@ fn retry_creates_new_provider_session_and_new_native_thread() {
     );
 }
 
+/// What the startup wait saw last, so a timeout says which condition never held.
+fn startup_state(fixture: &Fixture) -> String {
+    let db = fixture.data.join("senate.db");
+    let store = match SqliteStore::open(&db) {
+        Ok(store) => store,
+        Err(error) => return format!("store not open (exists={}): {error}", db.exists()),
+    };
+    let runs = store.list_runs().unwrap_or_default();
+    let Some(run) = runs.first() else {
+        return "no run".to_owned();
+    };
+    let processes = store.list_managed_processes(run.id).unwrap_or_default();
+    let listed: Vec<String> = processes
+        .iter()
+        .map(|p| {
+            let out = fs::read_to_string(p.spec().stdout_path()).unwrap_or_default();
+            format!(
+                "{:?} active={} completed_in_stdout={}",
+                p.status(),
+                p.status().is_active(),
+                out.contains("turn.completed")
+            )
+        })
+        .collect();
+    format!(
+        "run {:?}; processes {listed:?}; waiting file {}",
+        run.status,
+        fixture.data.join("release-provider.waiting").exists()
+    )
+}
+
 #[test]
 fn detached_frontend_leaves_tmux_provider_alive_and_resume_consumes_retained_output() {
     let fixture = Fixture::new();
@@ -446,7 +477,16 @@ fn detached_frontend_leaves_tmux_provider_alive_and_resume_consumes_retained_out
                 break (run.id, process.id(), session);
             }
         }
-        assert!(Instant::now() < deadline, "managed provider did not start");
+        if let Some(status) = frontend.try_wait().unwrap() {
+            let mut err = String::new();
+            let _ = std::io::Read::read_to_string(frontend.stderr.as_mut().unwrap(), &mut err);
+            panic!("the frontend exited before the provider started ({status}): {err}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "managed provider did not start: {}",
+            startup_state(&fixture)
+        );
         std::thread::sleep(Duration::from_millis(25));
     };
 

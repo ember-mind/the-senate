@@ -121,10 +121,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             })
         }
         Screen::NewRun => Vec::new(),
-        _ => state
-            .details
-            .as_ref()
-            .map_or_else(Vec::new, |details| header_identity(details, area.width)),
+        _ => state.details.as_ref().map_or_else(Vec::new, |details| {
+            header_identity(details, area.width, state.now())
+        }),
     };
     frame.render_widget(
         Paragraph::new(theme::spread(left, right, area.width)).block(
@@ -140,8 +139,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 /// CLI command takes — then workflow and repository, then the canonical run
 /// state and its wall-clock elapsed. Narrow terminals keep the state and drop
 /// the identity.
-fn header_identity(details: &RunDetails, width: u16) -> Vec<Span<'static>> {
-    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+fn header_identity(details: &RunDetails, width: u16, now: DateTime<Utc>) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if width >= HEADER_IDENTITY_WIDTH {
         let mut identity = details.id.to_string();
@@ -215,7 +213,7 @@ fn render_runs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         );
         return;
     }
-    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let now: DateTime<Utc> = state.now();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
@@ -389,7 +387,7 @@ fn render_missions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         );
         return;
     }
-    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let now: DateTime<Utc> = state.now();
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
@@ -988,7 +986,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(4), Constraint::Length(STATUS_HEIGHT)])
             .split(columns[0]);
-        render_status(frame, rows[1], details);
+        render_status(frame, rows[1], details, state.now());
         rows[0]
     } else {
         columns[0]
@@ -1006,8 +1004,7 @@ const STATUS_HEIGHT: u16 = 5;
 
 /// Bottom of the rail: the run's actual state in one or two plain sentences.
 /// Typed and state-driven like `activity_message` — never model prose.
-fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails) {
-    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+fn render_status(frame: &mut Frame<'_>, area: Rect, details: &RunDetails, now: DateTime<Utc>) {
     let width = area.width.saturating_sub(3);
     let mut lines = vec![theme::centered_rule(width), theme::section("STATUS")];
     lines.extend(
@@ -1180,7 +1177,7 @@ fn completed_sentence(details: &RunDetails) -> String {
 /// semantic durations. One vertical rule separates the rail from the hero —
 /// no boxes.
 fn render_pipeline(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
-    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let now: DateTime<Utc> = state.now();
     let width = area.width.saturating_sub(3);
     let task = details.task.as_deref().unwrap_or("<legacy input>");
     let title_width = width.saturating_sub(1) as usize;
@@ -1303,7 +1300,7 @@ fn stage_name_style(status: StageStatus, selected: bool) -> Style {
 /// Right panel, operational view: what is happening, for how long, on which
 /// runtime, what needs the user, what came out, and what can be done next.
 fn render_hero(frame: &mut Frame<'_>, area: Rect, state: &TuiState, details: &RunDetails) {
-    let now: DateTime<Utc> = std::time::SystemTime::now().into();
+    let now: DateTime<Utc> = state.now();
     let width = area.width.saturating_sub(3);
     let Some(selected) = details.stages.get(state.selected_stage_index) else {
         frame.render_widget(
@@ -5590,6 +5587,8 @@ mod tests {
     fn a_reaction_reaches_the_screen_without_moving_anything() {
         const WIDTH: u16 = 160;
         let mut state = running_state();
+        // Both frames at one instant, so only the reaction can differ.
+        state.clock = Some(at(12, 30, 0));
         let resting = render_symbols(&state, WIDTH, 40);
         state.reacting = true;
         let reacting = render_symbols(&state, WIDTH, 40);
@@ -5639,9 +5638,14 @@ mod tests {
     #[test]
     fn a_blink_repaints_cells_and_never_moves_them() {
         const WIDTH: u16 = 160;
+        // One clock for both frames: an elapsed time ticking over between
+        // the two renders is not motion.
+        let clock = Some(at(12, 30, 0));
         let mut resting = running_state();
         resting.motion_phase = 0;
+        resting.clock = clock;
         let mut blinking = running_state();
+        blinking.clock = clock;
         // The blink tick of the loop in `motion`, which the prop cycle rests
         // on — so the only cells this frame may repaint are POD's eyes.
         blinking.motion_phase = 5;

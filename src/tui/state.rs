@@ -800,10 +800,20 @@ pub(crate) struct TuiState {
     /// read from the clock here, so a drawn frame stays a pure function of
     /// state and no test has to wait for one.
     pub motion_phase: u8,
+    /// The wall clock a frame is drawn at. `None` reads the system clock;
+    /// tests pin it so two frames of the same state never differ by an
+    /// elapsed time that ticked over between them.
+    pub clock: Option<chrono::DateTime<chrono::Utc>>,
     pub quit: bool,
 }
 
 impl TuiState {
+    /// The time this frame is drawn at: the pinned clock, or now.
+    pub(crate) fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.clock
+            .unwrap_or_else(|| std::time::SystemTime::now().into())
+    }
+
     pub(crate) fn new(repository: &Path) -> Self {
         Self {
             screen: Screen::Runs,
@@ -864,6 +874,7 @@ impl TuiState {
             reaction_until: None,
             reacting: false,
             motion_phase: 0,
+            clock: None,
             quit: false,
         }
     }
