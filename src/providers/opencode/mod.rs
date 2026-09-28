@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 
 use crate::domain::{
     AttentionKind, AttentionRequestId, EffortSetting, ModelId, ProviderId, ProviderSessionId, Role,
@@ -189,15 +190,13 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
 
     /// Writes this invocation's permission config, the shape stage kind alone
     /// decides (see [`command::OpencodeSandbox`]), to a run-private path this
-    /// invocation's `OPENCODE_CONFIG` will point at.
-    fn write_config(
-        path: &Path,
-        stage_kind: StageKind,
-        bash_allow: &BTreeMap<String, String>,
-    ) -> Result<(), OpencodeProviderError> {
+    /// invocation's `OPENCODE_CONFIG` points at for the record. `OPENCODE_CONFIG`
+    /// is not the enforcement authority — a repository-controlled
+    /// `opencode.json` can override it — so the same `config["permission"]`
+    /// value is also carried as `OPENCODE_PERMISSION`, built by the caller.
+    fn write_config(path: &Path, config: &Value) -> Result<(), OpencodeProviderError> {
         create_private_parent(path)?;
-        let config = command::OpencodeSandbox::for_stage(stage_kind).permission_config(bash_allow);
-        std::fs::write(path, serde_json::to_vec_pretty(&config)?)?;
+        std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -350,16 +349,20 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         let mut bash_allow = Self::bash_allow(store, request)?;
         // A pending permission attention resolves into this invocation's own
         // command and config: an approval widens the allowlist by exactly the
-        // denied command and asks the agent to retry it; a decline grants
-        // nothing and carries the operator's instruction instead. Read before
-        // `bind_process` below, which clears it.
+        // denied command's own top-level parts (opencode's own permission
+        // granularity — a compound command is checked part by part) and asks
+        // the agent to retry it; a decline grants nothing and carries the
+        // operator's instruction instead. Read before `bind_process` below,
+        // which clears it.
         let attention_note = if let Some(pending) = session.pending_attention() {
             let command = Self::read_pending_denial(store, pending)?;
             match self.read_response(session.id(), pending.attention_id())? {
                 None => {
-                    let pattern = command::exact_bash_pattern(&command)
+                    let patterns = command::exact_bash_patterns(&command)
                         .map_err(OpencodeProviderError::UnsafePermission)?;
-                    bash_allow.insert(pattern, "allow".to_owned());
+                    for pattern in patterns {
+                        bash_allow.insert(pattern, "allow".to_owned());
+                    }
                     Some(format!(
                         "The operator approved the command you were denied permission to run: `{command}`. It is now allowed; retry it, then continue the task."
                     ))
@@ -371,7 +374,10 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         } else {
             None
         };
-        Self::write_config(&config_path, request.stage_kind(), &bash_allow)?;
+        let config = command::OpencodeSandbox::for_stage(request.stage_kind())
+            .permission_config(&bash_allow);
+        Self::write_config(&config_path, &config)?;
+        let permission = &config["permission"];
 
         let command = if let Some(native) = session.native_session_id() {
             let mut prompt = prompt::continuation(request);
@@ -387,6 +393,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
                 self.effort,
                 request.workspace_path(),
                 &config_path,
+                permission,
             )
         } else {
             let artifacts = store.list_artifacts(request.run_id())?;
@@ -405,6 +412,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
                 self.effort,
                 request.workspace_path(),
                 &config_path,
+                permission,
             )
         };
         let process = self.manager.prepare_with_input(
@@ -834,7 +842,7 @@ impl<B: ProcessBackend> Provider for OpencodeProvider<B> {
             let command = Self::read_pending_denial(store, pending)?;
             match response {
                 None => {
-                    command::exact_bash_pattern(&command)
+                    command::exact_bash_patterns(&command)
                         .map_err(OpencodeProviderError::UnsafePermission)?;
                 }
                 Some(text) if !text.trim().is_empty() => {
@@ -1086,6 +1094,23 @@ mod tests {
         "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"reason\":\"stop\",\"tokens\":{\"total\":30,\"input\":20,\"output\":10}}}\n"
     );
 
+    /// Shape copied from a real end-to-end run: opencode splits a compound
+    /// command into top-level parts and checks each one, so a denial names
+    /// every part (`bash (pwd, ls -la); auto-rejecting`, real stderr) even
+    /// though only `pwd` was actually ungranted.
+    const COMPOUND_PERMISSION_HALT_OUTPUT: &str = concat!(
+        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\"}}\n",
+        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_1\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"pwd && ls -la\"},\"error\":\"The user rejected permission to use this specific tool call.\"}}}\n",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"tool-calls\",\"tokens\":{\"total\":50,\"input\":40,\"output\":10}}}\n"
+    );
+
+    const COMPOUND_RESUME_AFTER_APPROVAL_OUTPUT: &str = concat!(
+        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\"}}\n",
+        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_2\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"pwd && ls -la\"},\"output\":\"\"}}}\n",
+        "{\"type\":\"text\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"text\":\"# opencode result\\nDone.\"}}\n",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"reason\":\"stop\",\"tokens\":{\"total\":30,\"input\":20,\"output\":10}}}\n"
+    );
+
     /// Shape copied from the real `err-402.jsonl` fixture.
     const INSUFFICIENT_BALANCE_OUTPUT: &str = "{\"type\":\"error\",\"sessionID\":\"ses_A\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Insufficient Balance\",\"statusCode\":402}}}\n";
 
@@ -1223,11 +1248,31 @@ mod tests {
     /// what a `-s ses_A` resume looks like once approved. Records every
     /// invocation's exact argv, so a test can check the resume actually
     /// carries `--session ses_A`.
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct HaltThenResumeBackend {
+        halt_output: &'static str,
+        resume_output: &'static str,
         started: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
         completed: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
         invocations: Arc<Mutex<Vec<RecordedInvocation>>>,
+    }
+
+    impl Default for HaltThenResumeBackend {
+        fn default() -> Self {
+            Self::new(PERMISSION_HALT_OUTPUT, RESUME_AFTER_APPROVAL_OUTPUT)
+        }
+    }
+
+    impl HaltThenResumeBackend {
+        fn new(halt_output: &'static str, resume_output: &'static str) -> Self {
+            Self {
+                halt_output,
+                resume_output,
+                started: Arc::new(Mutex::new(HashSet::new())),
+                completed: Arc::new(Mutex::new(HashSet::new())),
+                invocations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl ProcessBackend for HaltThenResumeBackend {
@@ -1258,9 +1303,9 @@ mod tests {
                 .unwrap()
                 .push((process.invocation(), argv));
             let output = if process.invocation() == 1 {
-                PERMISSION_HALT_OUTPUT
+                self.halt_output
             } else {
-                RESUME_AFTER_APPROVAL_OUTPUT
+                self.resume_output
             };
             std::fs::write(process.spec().stdout_path(), output)?;
             self.started.lock().unwrap().insert(process.id());
@@ -1488,6 +1533,23 @@ mod tests {
                 .environment()
                 .contains_key(&std::ffi::OsString::from("OPENCODE_CONFIG"))
         );
+        // A repository-controlled opencode.json overriding OPENCODE_CONFIG is
+        // a verified real vulnerability; every real managed process spec must
+        // carry both independently-verified defenses, and --pure, end to end.
+        assert_eq!(
+            process
+                .spec()
+                .environment()
+                .get(&std::ffi::OsString::from("OPENCODE_DISABLE_PROJECT_CONFIG")),
+            Some(&std::ffi::OsString::from("1"))
+        );
+        assert!(
+            process
+                .spec()
+                .environment()
+                .contains_key(&std::ffi::OsString::from("OPENCODE_PERMISSION")),
+        );
+        assert!(argv.iter().any(|arg| arg == "--pure"), "{argv:?}");
 
         let events = store.load_events(run_id).unwrap();
         assert_eq!(
@@ -1604,6 +1666,55 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
         assert_eq!(
             config["permission"]["bash"]["python3 -c \"from calc import add; assert add(2,3)==5\""],
+            serde_json::json!("allow")
+        );
+    }
+
+    /// Regression for a real end-to-end failure: approving a compound denial
+    /// (`pwd && ls -la`) used to grant the whole joined string as one
+    /// pattern, which matched neither of opencode's own split parts and the
+    /// same denial repeated forever. Approval must grant every split part.
+    #[test]
+    fn approving_a_compound_denial_grants_every_split_part() {
+        let backend = HaltThenResumeBackend::new(
+            COMPOUND_PERMISSION_HALT_OUTPUT,
+            COMPOUND_RESUME_AFTER_APPROVAL_OUTPUT,
+        );
+        let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
+        let mut engine = WorkflowEngine::new(provider, "fix the bug");
+        let request_id = loop {
+            match engine.drive(&mut store, run_id).unwrap() {
+                EngineStatus::NeedsUser { requests } => break requests[0],
+                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
+                status => panic!("unexpected status: {status:?}"),
+            }
+        };
+        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
+
+        engine
+            .resolve_attention_with_response(&mut store, run_id, request_id, None)
+            .unwrap();
+        assert_eq!(
+            drive_to_completion(&mut engine, &mut store, run_id),
+            RunStatus::Completed
+        );
+
+        let config_path = temp
+            .path()
+            .join("runs")
+            .join(run_id.to_string())
+            .join("provider-output")
+            .join("opencode")
+            .join(session.id().to_string())
+            .join("invocation-2.config.json");
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["permission"]["bash"]["pwd"],
+            serde_json::json!("allow")
+        );
+        assert_eq!(
+            config["permission"]["bash"]["ls -la"],
             serde_json::json!("allow")
         );
     }

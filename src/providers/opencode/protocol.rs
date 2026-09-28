@@ -132,7 +132,7 @@ pub(crate) fn denied_bash(line: &[u8]) -> Option<String> {
         return None;
     }
     let message = state.get("error").and_then(Value::as_str)?;
-    if !message.to_ascii_lowercase().contains("rejected permission") {
+    if !is_permission_denial(message) {
         return None;
     }
     state
@@ -140,6 +140,21 @@ pub(crate) fn denied_bash(line: &[u8]) -> Option<String> {
         .get("command")?
         .as_str()
         .map(ToOwned::to_owned)
+}
+
+/// Whether one `tool_use` error message is opencode's own auto-rejection of a
+/// permission it could not interactively ask about. The exact JSON wording
+/// verified by hand is "The user rejected permission to use this specific
+/// tool call."; the separate colour-coded stderr line opencode prints
+/// alongside it (`! permission requested: bash (...); auto-rejecting`) is
+/// not parsed here — it comma-joins split sub-command parts, which is
+/// ambiguous to read back — but its own characteristic wording is accepted
+/// as an alternate match in case a future opencode version folds it into the
+/// JSON error text directly, so detection does not silently break on a
+/// wording change alone.
+fn is_permission_denial(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rejected permission") || lower.contains("auto-reject")
 }
 
 fn decode(value: &Value) -> Result<OpencodeEvent, OpencodeProviderError> {
@@ -170,11 +185,22 @@ fn decode_tool_use(part: &Value) -> OpencodeKind {
         let denied = state
             .get("error")
             .and_then(Value::as_str)
-            .is_some_and(|text| text.to_ascii_lowercase().contains("rejected permission"));
+            .is_some_and(is_permission_denial);
         if denied {
-            format!(
-                "opencode was denied permission to use `{tool}`; the agent continues without it"
-            )
+            // A denied "ask" (bash, the only tool this adapter's config ever
+            // sets to "ask") halts the whole invocation — it does not
+            // continue — so the command itself, not a vague "continues
+            // without it", is what the operator needs to see here.
+            let command = state
+                .get("input")
+                .and_then(|input| input.get("command"))
+                .and_then(Value::as_str);
+            match command {
+                Some(command) => {
+                    format!("opencode was denied permission to run `{command}`; the turn stopped")
+                }
+                None => format!("opencode was denied permission to use `{tool}`; the turn stopped"),
+            }
         } else {
             format!("opencode tool `{tool}` failed")
         }
@@ -285,7 +311,8 @@ mod tests {
     }
 
     /// Shape copied from the real `ro.jsonl` fixture: a denied permission
-    /// becomes bounded progress, never the raw command or the full rule dump.
+    /// becomes bounded progress, never the raw denial message or a rule dump.
+    /// No command is named when the record itself carries none.
     #[test]
     fn a_denied_tool_is_progress_without_leaking_the_denial_text() {
         let raw = br#"{"type":"tool_use","sessionID":"ses_A","part":{"tool":"bash","state":{"status":"error","error":"The user rejected permission to use this specific tool call."}}}
@@ -296,7 +323,35 @@ mod tests {
         };
         assert!(progress.contains("denied permission"));
         assert!(progress.contains("bash"));
+        assert!(progress.contains("the turn stopped"));
+        assert!(!progress.contains("continues without it"));
         assert!(!progress.contains("rejected permission to use this specific tool call"));
+    }
+
+    /// A denied `bash` halts the whole turn (verified against a real
+    /// end-to-end run), so the progress line names the exact command instead
+    /// of the vague "continues without it" this used to say.
+    #[test]
+    fn a_denied_bash_call_names_the_exact_command_and_says_the_turn_stopped() {
+        let raw = br#"{"type":"tool_use","sessionID":"ses_A","part":{"tool":"bash","state":{"status":"error","input":{"command":"pwd && ls -la"},"error":"The user rejected permission to use this specific tool call."}}}
+"#;
+        let (event, _) = first_record(raw).unwrap().unwrap();
+        let OpencodeKind::ToolUse { progress } = event.kind else {
+            panic!("expected tool use");
+        };
+        assert!(progress.contains("pwd && ls -la"));
+        assert!(progress.contains("the turn stopped"));
+    }
+
+    /// A future opencode JSON error wording that folds in "auto-reject" is
+    /// still recognised, not only the exact wording verified by hand.
+    #[test]
+    fn is_permission_denial_accepts_the_auto_reject_wording_too() {
+        assert!(is_permission_denial(
+            "The user rejected permission to use this specific tool call."
+        ));
+        assert!(is_permission_denial("auto-rejecting this call"));
+        assert!(!is_permission_denial("some unrelated failure"));
     }
 
     #[test]
