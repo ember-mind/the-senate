@@ -1,6 +1,6 @@
-# Native providers (Claude Code, Codex CLI, Fake)
+# Native providers (Claude Code, Codex CLI, opencode CLI, Fake)
 
-Run each stage through the locally installed `claude` or `codex` executable with its own authentication and configuration, or through the deterministic Fake provider for tests.
+Run each stage through the locally installed `claude`, `codex`, or `opencode` executable with its own authentication and configuration, or through the deterministic Fake provider for tests.
 
 ## Sub-features
 - claude: non-interactive stream-JSON print mode, `dontAsk` permissions, prompt on immutable stdin; denied tools become typed permission attention; questions (`AskUserQuestion`) need `--response`.
@@ -8,6 +8,11 @@ Run each stage through the locally installed `claude` or `codex` executable with
 - claude-repo-allowlist: the `[permissions] allow` table of `<worktree>/.senate.toml` — or of `<source repo>/.senate.toml` when the worktree carries no such file — becomes `--allowedTools` on every Claude invocation, initial and resumed, beside the baseline above and anything a resolved attention granted. Rules are native Claude Code rules, passed through verbatim; a rule that grants every tool (`*`, `Bash(*)`) or an empty one fails the stage.
 - codex: `codex exec --json` with prompt `-` on stdin, `--ask-for-approval never`, sandbox `read-only` for non-mutating stage kinds and `workspace-write` for Implementation/Fix/FollowUp; no typed attention.
 - codex-dead-process-completion: a `turn.completed` whose process then died (non-zero exit, signal, or vanished) completes only if the `--output-last-message` file equals the last agent message in the retained stream; otherwise the record is consumed and the stage becomes a recoverable interruption. A requested stop reports interruption without consulting the file, and a `broken` supervisor still fails the poll.
+- opencode: explicit-only (`--provider opencode --model <provider/model>`; never chosen by `--profile recommended`, never a Recommended fallback). Drives `opencode run --format json -m <provider/model> [--variant <effort>] [--session <id>] --dir <worktree> "<prompt>"`. Auth is native (`~/.local/share/opencode/auth.json`); a configured model is validated against `opencode models` before launch, failing fast instead of reaching the vendor's own vague `UnknownError`. Model id carries the vendor (`opencode-go/deepseek-v4-pro`, `google/gemini-2.5-pro`, `opencode-go/kimi-k3`, ...); the Implementer world view colours by that vendor, not by `opencode` itself.
+- opencode-prompt-is-argv: `opencode run --help` (v1.18.32, verified by hand) offers no stdin or file-based prompt; the stage prompt is the last positional argument, capped at a 256 KiB argv-safety ceiling (well under every documented `ARG_MAX`) with the same navigation-evidence shedding Codex's prompt uses before failing closed.
+- opencode-permission-config: a per-invocation JSON file passed as `OPENCODE_CONFIG` (merges with, does not replace, `~/.config/opencode`). Read-only stage kinds (mirrors Codex's `read-only` set exactly) deny edit, bash, webfetch, and external-directory access outright. Implementation/Fix/FollowUp allow edit, still deny webfetch and external-directory access, and gate bash behind `{"*":"ask", <pattern>: "allow", ...}`, where the allowed patterns are the repository's own Claude bash allowlist (`src/providers/claude/permissions.rs`) translated onto opencode's glob syntax — a repository states its safe commands once, not once per provider.
+- opencode-denial-is-progress: headless opencode auto-rejects a permission it cannot ask about and keeps going; the denial becomes visible `ProviderProgress`, never a typed continuable permission request — opencode's protocol offers no safe way to resume with broadened scope, the same posture Codex holds for its own undecided attention.
+- opencode-completion-trust: opencode writes no corroborating final-message file the way Codex's `--output-last-message` does. A terminal `step_finish` (`reason: "stop"`) is trusted only on a clean process exit; anything else becomes a recoverable interruption rather than a trusted completion — a stricter, simpler rule than Codex's file-corroborated one, made explicit because opencode has no second independent write to check.
 - fake: scripted signals (start, progress, usage, attention, pause, interruption, completion, failure) without editing files; scenario `development_fake/default_success_v1`.
 - verify: provider id `verify`, a deterministic command runner serving only `Role::Verifier`; routed implicitly, never chosen by `--provider` or a profile, never a provider session (see verification.md).
 - permission-continuation: `resolve` reconstructs the exact denial from retained output, converts it to a native `--allowedTools` rule, and resumes the same Claude session UUID in a new managed invocation.
@@ -15,31 +20,36 @@ Run each stage through the locally installed `claude` or `codex` executable with
 - doctor: reports CLI versions, auth status and suspicious credential environment variable names.
 
 ## How to get to it (user POV)
-Install and log into `claude` and/or `codex` natively, confirm with `senate doctor`, then start runs with `--provider claude`, `--provider codex`, or Recommended. When a Claude stage stops with `needs_user`, read the attention line in `status` and answer with `resolve`. Codex has no attention path; a native denial fails the stage and you `retry`.
+Install and log into `claude` and/or `codex` natively, confirm with `senate doctor`, then start runs with `--provider claude`, `--provider codex`, or Recommended. When a Claude stage stops with `needs_user`, read the attention line in `status` and answer with `resolve`. Codex has no attention path; a native denial fails the stage and you `retry`. opencode is explicit-only: install and authenticate it, confirm with `senate doctor`, then name it and a model by hand (`--provider opencode --model <provider/model>`); it is never `--profile recommended`'s choice. opencode has no attention path either; a denied permission is visible progress, not a `needs_user` stop.
 
 ## Driving it
 ```bash
 senate doctor
 senate fast "<task>" --provider claude
 senate fast "<task>" --provider codex
+senate fast "<task>" --provider opencode --model opencode-go/deepseek-v4-pro
 senate fast "<task>" --provider fake
 senate resolve <run-id> <attention-id>                      # approve exact permission
 senate resolve <run-id> <attention-id> --response "<text>"  # answer AskUserQuestion
+senate retry <run-id> <stage-id> --provider opencode --model opencode-go/kimi-k3
 SENATE_REAL_CLAUDE=1 cargo test --test claude_real -- --ignored --nocapture
 SENATE_REAL_CODEX=1 cargo test --test codex_real -- --ignored --nocapture
+SENATE_REAL_OPENCODE=1 cargo test --test opencode_real -- --ignored --nocapture
 ```
 TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer if it is a question, Enter resolves.
 
 ## Where it lives
 - `src/providers/claude/` — `detection.rs` (install/auth discovery), `command.rs` (argv, `--resume`, `--allowedTools`, `--effort`), `permissions.rs` (`.senate.toml` `[permissions]` reader), `protocol.rs` (JSONL decoder, `PermissionDenial`, terminal-attention rules), `prompt.rs`, `artifact.rs`, `mod.rs` (adapter).
 - `src/providers/codex/` — `detection.rs`, `command.rs` (`exec --json`, sandbox, `-c model_reasoning_effort`), `protocol.rs`, `session_meta.rs`, `mod.rs`.
+- `src/providers/opencode/` — `detection.rs` (install/auth/model-listing discovery), `command.rs` (argv, `--variant`, permission-config JSON, bash-allowlist translation from `claude::permissions`), `protocol.rs` (JSON-line decoder), `prompt.rs`, `artifact.rs`, `mod.rs` (adapter).
 - `src/providers/session.rs`, `src/providers/checkpoint.rs`, `src/providers/artifact.rs` — provider session, atomic commit payload, immutable artifact record.
 - `src/engine/fake.rs` — Fake scenarios.
 - `src/providers/verify/` — the `verify` provider (`mod.rs` adapter, `config.rs`, `runner.rs`, `artifact.rs`).
 - `src/engine/provider.rs` — provider-neutral `ProviderRequest`/`ProviderPoll` boundary.
 - `src/store/provider.rs` — provider-session and artifact persistence.
+- `src/world/projection.rs` — `colour_key` maps an opencode stage's model id onto the vendor `world/js/models.js` colours.
 - `tests/routing_cli.rs` — `recommended_attention_restart_routes_response_to_same_claude_session`.
-- `tests/codex_cli.rs`, `tests/claude_real.rs`, `tests/codex_real.rs`.
+- `tests/codex_cli.rs`, `tests/claude_real.rs`, `tests/codex_real.rs`, `tests/opencode_cli.rs`, `tests/opencode_real.rs`.
 
 ## Gotchas
 - `permission_denials` in a Claude result is per-process, not per-session: every retry after a `--resume` gets a new `tool_use_id`. A list that looks cumulative across the resume boundary is not; treating it as residual history misclassifies a fresh attempt. Split by `tool_use_id` (`PermissionDenial::same_request`).
@@ -56,3 +66,8 @@ TUI: `u` opens the attention overlay; ↑/↓ choose the request, type an answer
 - Unknown valid JSONL records become non-semantic checkpoints; an invalid complete record fails without advancing the cursor; a partial line waits.
 - Claude usage comes from the terminal result record only; per-message usage is discarded on purpose.
 - `--provider fake` still verifies for real: the Fake provider fakes agent roles only, and the `verify` stage runs the repository's commands regardless of the selection.
+- opencode's model id is not optional in practice: unlike Claude/Codex, opencode has no single native default across the dozens of vendors it fans out to, so `--provider opencode` without `--model` runs whatever opencode's own CLI defaults to, and the routing/status surfaces still report it as "native default" rather than the vendor that actually served the stage.
+- opencode carries the session id on every event line, unlike Codex's dedicated `thread.started`; the adapter binds (or re-confirms, on resume) native identity from whichever record happens to arrive first for an invocation, and emits `Started` only when that is the stage's very first signal — every later invocation, including a resume, reports `Resumed`.
+- No runtime observation of the confirmed model or effort exists for opencode (Codex's own equivalent reads its session-rollout files, which opencode has no analog of verified here): `actual=opencode/unconfirmed` is expected even on a successful stage, not a bug.
+- opencode's tokens are reported per `step_finish`, not once per turn as Codex's `turn.completed` is; the adapter emits one usage delta per non-terminal step plus the terminal one, and the existing multi-event usage summation adds them up exactly as multi-message Claude/Codex usage already does.
+- The image-generation tool is a Codex CLI backend only; a role granted it but routed to opencode (via `--provider opencode` or `retry --provider opencode` naming that role) is a typed refusal at runtime, never a silent run without the tool.

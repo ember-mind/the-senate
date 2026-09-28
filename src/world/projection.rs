@@ -144,10 +144,37 @@ impl StageView {
 
     fn worker(&self) -> Worker {
         Worker {
-            provider: self.provider.clone(),
+            provider: colour_key(&self.provider, self.model.as_deref()),
             model: self.model.clone(),
         }
     }
+}
+
+/// What `world/js/models.js` keys a colour by for one stage's provider.
+///
+/// Every provider but opencode names its own colour directly. opencode fans
+/// one native CLI out to dozens of vendors through its model id
+/// (`opencode-go/deepseek-v4-pro`, `google/gemini-2.5-pro`, ...), so for
+/// opencode alone the colour follows the vendor the model names, not the
+/// provider that ran it — the model, never a vendor logo, is what the world
+/// promises to colour. A vendor the front end has no colour for keeps
+/// `modelOf`'s existing fallback (the provider's own name, no colour) exactly
+/// as an unrecognised provider already does.
+const VENDORS: &[&str] = &["deepseek", "gemini", "qwen", "kimi"];
+
+fn colour_key(provider: &str, model: Option<&str>) -> String {
+    if provider != "opencode" {
+        return provider.to_owned();
+    }
+    model
+        .and_then(|model| {
+            let lower = model.to_ascii_lowercase();
+            VENDORS
+                .iter()
+                .find(|vendor| lower.contains(*vendor))
+                .copied()
+        })
+        .map_or_else(|| provider.to_owned(), ToOwned::to_owned)
 }
 
 const fn is_review(kind: StageKind) -> bool {
@@ -1010,6 +1037,43 @@ mod tests {
         );
         assert_eq!(world.censor.reviewer.as_ref().unwrap().provider, "claude");
         assert!(world.consul.summary[0].contains("The Censor is reviewing Event queue."));
+    }
+
+    /// opencode fans one native CLI out to dozens of vendors through its
+    /// model id; the world colours the vendor the model names, not
+    /// `opencode` itself, so a `DeepSeek` and a Kimi stage read as distinctly
+    /// as Claude and Codex already do. Every other provider is unaffected,
+    /// and an opencode model naming no known vendor keeps the same fallback
+    /// an unrecognised provider already gets.
+    #[test]
+    fn opencode_stages_colour_by_the_models_vendor() {
+        assert_eq!(
+            colour_key("opencode", Some("opencode-go/deepseek-v4-pro")),
+            "deepseek"
+        );
+        assert_eq!(colour_key("opencode", Some("opencode-go/kimi-k3")), "kimi");
+        assert_eq!(
+            colour_key("opencode", Some("google/gemini-2.5-pro")),
+            "gemini"
+        );
+        assert_eq!(
+            colour_key("opencode", Some("opencode-go/qwen3-max")),
+            "qwen"
+        );
+        // An opencode model naming no known vendor, or no model at all,
+        // falls back to `opencode` itself — the same fallback `modelOf`
+        // already gives an unrecognised provider.
+        assert_eq!(
+            colour_key("opencode", Some("opencode-go/glm-5.3")),
+            "opencode"
+        );
+        assert_eq!(colour_key("opencode", None), "opencode");
+        // Every other provider names its own colour directly, model or not.
+        assert_eq!(colour_key("claude", None), "claude");
+        assert_eq!(
+            colour_key("codex", Some("opencode-go/deepseek-v4-pro")),
+            "codex"
+        );
     }
 
     #[test]

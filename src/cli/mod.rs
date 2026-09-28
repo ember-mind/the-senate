@@ -82,8 +82,9 @@ pub enum Command {
     Retry {
         run_id: RunId,
         stage_id: StageId,
-        /// Send this stage to another provider (claude|codex|fake) instead of
-        /// the one its role was configured with. Only this stage moves.
+        /// Send this stage to another provider (claude|codex|opencode|fake)
+        /// instead of the one its role was configured with. Only this stage
+        /// moves.
         #[arg(long)]
         provider: Option<String>,
         /// Model for the provider named by --provider; omit for its native
@@ -392,14 +393,22 @@ pub struct RunArgs {
     /// Git repository; defaults to current directory.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,
-    /// Native provider (`claude` or `codex`) or deterministic development
-    /// provider (`fake`). Overrides the default routing profile.
+    /// Native provider (`claude`, `codex`, or `opencode`) or deterministic
+    /// development provider (`fake`). Overrides the default routing profile.
+    /// `opencode` is never chosen by `--profile recommended`; it must be
+    /// named explicitly.
     #[arg(long, conflicts_with = "profile")]
     pub provider: Option<String>,
     /// Versioned routing profile (`recommended`). Used by default when neither
     /// selection flag is given.
     #[arg(long, conflicts_with = "provider")]
     pub profile: Option<String>,
+    /// Explicit model for `--provider`, every role. Required in practice for
+    /// `--provider opencode`, whose model id carries the vendor (for example
+    /// `opencode-go/deepseek-v4-pro` or `google/gemini-2.5-pro`); omitted for
+    /// Claude or Codex means their own native default.
+    #[arg(long, requires = "provider")]
+    pub model: Option<String>,
     /// Requested native-runtime effort. One level for every role
     /// (`native|low|medium|high|xhigh`), or `role=level[,role=level]` to
     /// name some roles and leave the rest to the routing profile. Omitted

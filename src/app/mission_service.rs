@@ -1166,7 +1166,7 @@ mod tests {
                 &runs,
                 mission.id,
                 "How should we split this?",
-                fake,
+                fake.clone(),
                 EffortRequest::ProfileDefault,
             )
             .unwrap();
@@ -1200,7 +1200,7 @@ mod tests {
                 &runs,
                 mission.id,
                 "Go on.",
-                fake,
+                fake.clone(),
                 EffortRequest::ProfileDefault,
             )
             .unwrap();

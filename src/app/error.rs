@@ -6,6 +6,7 @@ use crate::git::GitError;
 use crate::process::ProcessError;
 use crate::providers::claude::ClaudeProviderError;
 use crate::providers::codex::CodexProviderError;
+use crate::providers::opencode::OpencodeProviderError;
 use crate::store::{RunInputError, StoreError};
 use crate::workspace::WorkspaceError;
 
@@ -96,14 +97,16 @@ pub enum AppError {
     #[error(transparent)]
     Codex(#[from] CodexProviderError),
     #[error(transparent)]
+    Opencode(#[from] OpencodeProviderError),
+    #[error(transparent)]
     Process(#[from] ProcessError),
     #[error(transparent)]
     Routing(#[from] RoutingError),
     #[error(
-        "execution selection is required; use --provider claude|codex|fake or --profile recommended"
+        "execution selection is required; use --provider claude|codex|opencode|fake or --profile recommended"
     )]
     NoProductionProvider,
-    #[error("unsupported provider {0:?}; supported providers: claude, codex, fake")]
+    #[error("unsupported provider {0:?}; supported providers: claude, codex, opencode, fake")]
     UnsupportedProvider(String),
     #[error(
         "image generation cannot be enabled: {0}. Install and authenticate the Codex CLI (`codex login`) and retry, or start without --allow-image-generation."

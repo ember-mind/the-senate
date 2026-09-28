@@ -94,6 +94,7 @@ fn main() -> std::io::Result<()> {
         }
         "codex" => codex_fixture(&arguments.collect::<Vec<_>>())?,
         "claude" => claude_fixture(&arguments.collect::<Vec<_>>())?,
+        "opencode" => opencode_fixture(&arguments.collect::<Vec<_>>())?,
         _ => {
             std::io::stderr().write_all(b"unknown fixture mode\n")?;
             std::process::exit(64);
@@ -421,6 +422,134 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         serde_json::json!({
             "type":"turn.completed",
             "usage":{"input_tokens":11,"cached_input_tokens":3,"output_tokens":7,"reasoning_output_tokens":2}
+        })
+    )?;
+    Ok(())
+}
+
+/// Fixture for `opencode run --format json ...`. Real opencode has no
+/// stdin-based prompt (see `providers::opencode::command`), so the stage
+/// prompt arrives as the last positional argv element and is parsed there,
+/// mirroring how the Codex fixture parses stdin.
+#[allow(
+    clippy::too_many_lines,
+    reason = "single fixture command keeps native CLI protocol behavior inspectable"
+)]
+fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
+    let args = arguments
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    match args.as_slice() {
+        [version] if version == "--version" => {
+            writeln!(std::io::stdout(), "1.18.32")?;
+            return Ok(());
+        }
+        [auth, list] if auth == "auth" && list == "list" => {
+            if std::env::var_os("SENATE_FAKE_OPENCODE_UNAUTHENTICATED").is_some() {
+                writeln!(std::io::stdout(), "0 credentials")?;
+            } else {
+                writeln!(std::io::stdout(), "2 credentials")?;
+            }
+            return Ok(());
+        }
+        [models] if models == "models" => {
+            writeln!(
+                std::io::stdout(),
+                "opencode-go/deepseek-v4-pro\nopencode-go/kimi-k3\ngoogle/gemini-2.5-pro"
+            )?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    if args.first().map(String::as_str) != Some("run") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "fixture expected opencode run",
+        ));
+    }
+    let prompt = args.last().cloned().unwrap_or_default();
+    let stage = prompt
+        .lines()
+        .find_map(|line| line.strip_prefix("Stage: "))
+        .and_then(|line| line.split_once(' ').map(|(stage, _)| stage.to_owned()))
+        .unwrap_or_else(|| "resumed".to_owned());
+    let resumed_session = args
+        .iter()
+        .position(|argument| argument == "--session")
+        .and_then(|index| args.get(index + 1))
+        .cloned();
+    if let Some(capture) = std::env::var_os("SENATE_FAKE_OPENCODE_CAPTURE_DIR") {
+        let capture = std::path::PathBuf::from(capture);
+        std::fs::create_dir_all(&capture)?;
+        std::fs::write(capture.join(format!("{stage}.argv")), args.join("\n"))?;
+    }
+    if std::env::var_os("SENATE_FAKE_OPENCODE_WRITE").is_some() {
+        std::fs::write("hello.txt", "created by fake opencode\n")?;
+        std::fs::write("README.md", "fixture changed by fake opencode\n")?;
+    }
+    let session_id = resumed_session.unwrap_or_else(|| format!("ses_{stage}"));
+
+    if std::env::var_os("SENATE_FAKE_OPENCODE_ERROR").is_some() {
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "type":"error",
+                "sessionID":session_id,
+                "error":{"name":"APIError","data":{"message":"Insufficient Balance","statusCode":402}}
+            })
+        )?;
+        return Ok(());
+    }
+
+    let message_id = format!("msg_{stage}");
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({
+            "type":"step_start",
+            "sessionID":session_id,
+            "part":{"messageID":message_id}
+        })
+    )?;
+    if std::env::var_os("SENATE_FAKE_OPENCODE_DENY_BASH").is_some() {
+        writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "type":"tool_use",
+                "sessionID":session_id,
+                "part":{
+                    "tool":"bash",
+                    "state":{
+                        "status":"error",
+                        "error":"The user rejected permission to use this specific tool call."
+                    }
+                }
+            })
+        )?;
+    }
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({
+            "type":"text",
+            "sessionID":session_id,
+            "part":{"messageID":message_id,"text":format!("# {stage} result\nFake opencode completed.\n")}
+        })
+    )?;
+    writeln!(
+        std::io::stdout(),
+        "{}",
+        serde_json::json!({
+            "type":"step_finish",
+            "sessionID":session_id,
+            "part":{
+                "messageID":message_id,
+                "reason":"stop",
+                "tokens":{"total":17,"input":11,"output":6,"reasoning":0,"cache":{"write":0,"read":0}}
+            }
         })
     )?;
     Ok(())
