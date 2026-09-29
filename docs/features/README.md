@@ -16,7 +16,7 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 | Workspace | Isolated worktrees, apply, discard, pull request | [workspace.md](workspace.md) |
 | Verification | Run the repository's own checks after the last edit; failed checks block completion and apply, not `pr` | [verification.md](verification.md) |
 | Routing | Roles to providers/models, `--provider`, `--profile recommended`, v1 frozen / v2 current, `retry --provider` per-stage override | [routing.md](routing.md) |
-| Native providers | Claude Code and Codex adapters, permissions, sandboxes, attention | [providers.md](providers.md) |
+| Native providers | Claude Code, Codex, and opencode adapters, permissions, sandboxes, attention | [providers.md](providers.md) |
 | Evaluations | `eval list/run/report`, suites under `evals/`, evidence layout | [evaluations.md](evaluations.md) |
 | Observability and effort | Usage/latency/prompt-bytes telemetry and `--effort` | [observability-and-effort.md](observability-and-effort.md) |
 | Image generation | `--allow-image-generation`: the Implementer generates PNGs into the worktree through a Senate-owned OpenAI-backed tool | [image-generation.md](image-generation.md) |

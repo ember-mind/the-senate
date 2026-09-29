@@ -17,6 +17,7 @@ use crate::image::{
 };
 use crate::providers::claude::{ClaudeInstallation, ClaudeProvider, ClaudeProviderError};
 use crate::providers::codex::{CodexInstallation, CodexProvider, CodexProviderError};
+use crate::providers::opencode::{OpencodeInstallation, OpencodeProvider, OpencodeProviderError};
 use crate::providers::verify::VerifyProvider;
 use crate::store::{ResolvedConfigSnapshot, SequencedEvent, SqliteStore};
 
@@ -269,6 +270,7 @@ pub enum RuntimeProvider {
     Fake(FakeProvider),
     Claude(ClaudeProvider),
     Codex(CodexProvider),
+    Opencode(OpencodeProvider),
     Verify(VerifyProvider),
 }
 
@@ -278,6 +280,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.provider_id_for(request),
             Self::Claude(provider) => provider.provider_id_for(request),
             Self::Codex(provider) => provider.provider_id_for(request),
+            Self::Opencode(provider) => provider.provider_id_for(request),
             Self::Verify(provider) => provider.provider_id_for(request),
         }
     }
@@ -287,6 +290,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.supports_role(role),
             Self::Claude(provider) => provider.supports_role(role),
             Self::Codex(provider) => provider.supports_role(role),
+            Self::Opencode(provider) => provider.supports_role(role),
             Self::Verify(provider) => provider.supports_role(role),
         }
     }
@@ -296,6 +300,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.keep_attached_for(request),
             Self::Claude(provider) => provider.keep_attached_for(request),
             Self::Codex(provider) => provider.keep_attached_for(request),
+            Self::Opencode(provider) => provider.keep_attached_for(request),
             Self::Verify(provider) => provider.keep_attached_for(request),
         }
     }
@@ -310,6 +315,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.stage_attention_response(store, context, response),
             Self::Claude(provider) => provider.stage_attention_response(store, context, response),
             Self::Codex(provider) => provider.stage_attention_response(store, context, response),
+            Self::Opencode(provider) => provider.stage_attention_response(store, context, response),
             Self::Verify(provider) => provider.stage_attention_response(store, context, response),
         }
     }
@@ -323,6 +329,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.can_auto_resolve_attention(store, context),
             Self::Claude(provider) => provider.can_auto_resolve_attention(store, context),
             Self::Codex(provider) => provider.can_auto_resolve_attention(store, context),
+            Self::Opencode(provider) => provider.can_auto_resolve_attention(store, context),
             Self::Verify(provider) => provider.can_auto_resolve_attention(store, context),
         }
     }
@@ -345,6 +352,9 @@ impl Provider for RuntimeProvider {
             Self::Codex(provider) => {
                 provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
             }
+            Self::Opencode(provider) => {
+                provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
+            }
             Self::Verify(provider) => {
                 provider.stage_continue_instruction(store, run_id, stage_id, role, instruction)
             }
@@ -363,6 +373,9 @@ impl Provider for RuntimeProvider {
                 provider.discard_continue_instruction(store, run_id, stage_id)
             }
             Self::Codex(provider) => provider.discard_continue_instruction(store, run_id, stage_id),
+            Self::Opencode(provider) => {
+                provider.discard_continue_instruction(store, run_id, stage_id)
+            }
             Self::Verify(provider) => {
                 provider.discard_continue_instruction(store, run_id, stage_id)
             }
@@ -378,6 +391,7 @@ impl Provider for RuntimeProvider {
             Self::Fake(provider) => provider.poll(store, request),
             Self::Claude(provider) => provider.poll(store, request),
             Self::Codex(provider) => provider.poll(store, request),
+            Self::Opencode(provider) => provider.poll(store, request),
             Self::Verify(provider) => provider.poll(store, request),
         }
     }
@@ -576,6 +590,26 @@ impl RoutedProvider {
                             ))
                         })?,
                 ),
+                "opencode" => {
+                    // The image tool is a Codex CLI backend only (see
+                    // `src/image/`); opencode never learns to speak it, so a
+                    // role granted the tool but routed here is a typed
+                    // refusal rather than a silent run without it.
+                    if image_tool.is_some() {
+                        return Err(ProviderError::new(format!(
+                            "image generation is granted to {role:?} but the opencode provider does not support the image-generation tool; route this role to Codex or Claude, or start without --allow-image-generation"
+                        )));
+                    }
+                    RuntimeProvider::Opencode(
+                        self.opencode_provider(target.model_id().cloned())
+                            .map(|provider| provider.with_effort(effort))
+                            .map_err(|error| {
+                                ProviderError::new(format!(
+                                    "configured provider unavailable for opencode target: {error}"
+                                ))
+                            })?,
+                    )
+                }
                 VERIFY_PROVIDER_ID => RuntimeProvider::Verify(self.verify_provider()?),
                 other => {
                     return Err(ProviderError::new(format!(
@@ -633,6 +667,18 @@ impl RoutedProvider {
                 CodexProvider::from_runtime(model, root.clone(), runner.clone())
             }
             None => CodexProvider::from_environment(model),
+        }
+    }
+
+    fn opencode_provider(
+        &self,
+        model: Option<crate::domain::ModelId>,
+    ) -> Result<OpencodeProvider, OpencodeProviderError> {
+        match &self.isolated_runtime {
+            Some((root, runner)) => {
+                OpencodeProvider::from_runtime(model, root.clone(), runner.clone())
+            }
+            None => OpencodeProvider::from_environment(model),
         }
     }
 }
@@ -786,9 +832,13 @@ impl ProviderFactory for RuntimeProviderFactory {
         id: ConfigSnapshotId,
         created_at: DateTime<Utc>,
     ) -> Result<ResolvedConfigSnapshot, AppError> {
-        let availability = match selection {
-            ExecutionSelection::Uniform(provider) => {
-                require_explicit_provider(provider)?;
+        let availability = match &selection {
+            ExecutionSelection::Uniform(UniformProvider::Opencode) => {
+                return Err(AppError::OpencodeModelRequired);
+            }
+            ExecutionSelection::Uniform(provider)
+            | ExecutionSelection::UniformWithModel(provider, _) => {
+                require_explicit_provider(*provider)?;
                 RecommendedAvailability::default()
             }
             ExecutionSelection::Recommended => probe_recommended_availability()?,
@@ -819,9 +869,13 @@ impl ProviderFactory for RuntimeProviderFactory {
             CodexImageGenerator::from_environment()
                 .map_err(|error| AppError::ImageGenerationUnavailable(error.to_string()))?;
         }
-        let availability = match selection {
-            ExecutionSelection::Uniform(provider) => {
-                require_explicit_provider(provider)?;
+        let availability = match &selection {
+            ExecutionSelection::Uniform(UniformProvider::Opencode) => {
+                return Err(AppError::OpencodeModelRequired);
+            }
+            ExecutionSelection::Uniform(provider)
+            | ExecutionSelection::UniformWithModel(provider, _) => {
+                require_explicit_provider(*provider)?;
                 RecommendedAvailability::default()
             }
             ExecutionSelection::Recommended => probe_recommended_availability()?,
@@ -915,6 +969,15 @@ fn require_explicit_provider(provider: UniformProvider) -> Result<(), AppError> 
                 .authenticated()
                 .then_some(())
                 .ok_or(CodexProviderError::NotAuthenticated.into())
+        }
+        // Never probed for Recommended: opencode is explicit-only, never a
+        // Recommended fallback.
+        UniformProvider::Opencode => {
+            let installation = OpencodeInstallation::discover()?;
+            installation
+                .authenticated()
+                .then_some(())
+                .ok_or(OpencodeProviderError::NotAuthenticated.into())
         }
     }
 }

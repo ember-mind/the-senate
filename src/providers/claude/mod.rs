@@ -4,7 +4,12 @@ mod artifact;
 mod command;
 mod detection;
 mod error;
-mod permissions;
+// The opencode adapter derives its own bash allowlist from the same
+// repository allowlist this table reads, so the read side is shared rather
+// than duplicated; the file itself, and everything Claude-specific about it
+// (the `--allowedTools` rule syntax, the baseline), stay private to this
+// module.
+pub(crate) mod permissions;
 mod prompt;
 mod protocol;
 

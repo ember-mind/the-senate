@@ -214,7 +214,11 @@ fn service() -> Result<RunService<RuntimeProviderFactory>> {
 }
 
 fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
-    let selection = execution_selection(args.provider.as_deref(), args.profile.as_deref())?;
+    let selection = execution_selection(
+        args.provider.as_deref(),
+        args.profile.as_deref(),
+        args.model.as_deref(),
+    )?;
     let effort = parse_effort(args.effort.as_deref())?;
     let image = if args.allow_image_generation {
         crate::app::ImageGenerationPlan::implementer_only()
@@ -242,9 +246,16 @@ fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
 fn execution_selection(
     provider: Option<&str>,
     profile: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Option<ExecutionSelection>> {
     Ok(Some(match (provider, profile) {
-        (Some(provider), None) => ExecutionSelection::Uniform(UniformProvider::try_from(provider)?),
+        (Some(provider), None) => {
+            let provider = UniformProvider::try_from(provider)?;
+            match model {
+                Some(model) => ExecutionSelection::UniformWithModel(provider, ModelId::new(model)?),
+                None => ExecutionSelection::Uniform(provider),
+            }
+        }
         (None, Some("recommended") | None) => ExecutionSelection::Recommended,
         (None, Some(other)) => {
             anyhow::bail!("unsupported profile {other:?}; supported profiles: recommended")
@@ -497,6 +508,10 @@ fn print_distribution() {
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential report, one paragraph per provider/capability"
+)]
 fn doctor() -> Result<()> {
     let config_file = crate::config::config_file()?;
     let database_file = crate::store::database_file()?;
@@ -571,6 +586,33 @@ fn doctor() -> Result<()> {
         println!(
             "  Codex environment overrides: {}",
             codex_environment.join(", ")
+        );
+    }
+    match crate::providers::opencode::OpencodeInstallation::discover() {
+        Ok(installation) => {
+            println!("  opencode CLI: available ({})", installation.version());
+            println!(
+                "  opencode auth: {}",
+                if installation.authenticated() {
+                    "ready"
+                } else {
+                    "no configured credentials"
+                }
+            );
+        }
+        Err(crate::providers::opencode::OpencodeProviderError::NotFound) => {
+            println!("  opencode CLI: not found on PATH");
+            println!(
+                "  guidance: install opencode, authenticate with native `opencode auth login`, then rerun `senate doctor`. opencode is explicit-only: `--provider opencode --model <provider/model>`, never chosen by --profile recommended"
+            );
+        }
+        Err(error) => println!("  opencode CLI: error ({error})"),
+    }
+    let opencode_environment = crate::providers::opencode::suspicious_opencode_environment();
+    if !opencode_environment.is_empty() {
+        println!(
+            "  opencode environment overrides: {}",
+            opencode_environment.join(", ")
         );
     }
     println!("  fake provider: available (deterministic development/testing)");
@@ -765,7 +807,7 @@ fn mission(command: &MissionCommand) -> Result<()> {
             profile,
             effort,
         } => {
-            let selection = execution_selection(provider.as_deref(), profile.as_deref())?;
+            let selection = execution_selection(provider.as_deref(), profile.as_deref(), None)?;
             let effort = parse_effort(effort.as_deref())?;
             let (report, details) =
                 missions.start_package(&service()?, *mission_id, package_id, selection, effort)?;
@@ -824,7 +866,7 @@ fn mission(command: &MissionCommand) -> Result<()> {
             apply,
         } => {
             let routed = provider.is_some() || profile.is_some() || effort.is_some();
-            let selection = execution_selection(provider.as_deref(), profile.as_deref())?;
+            let selection = execution_selection(provider.as_deref(), profile.as_deref(), None)?;
             let effort = parse_effort(effort.as_deref())?;
             let continuing = missions.inspect_mission(*mission_id)?.lead.is_some();
             if continuing && routed {

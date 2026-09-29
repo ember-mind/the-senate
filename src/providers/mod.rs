@@ -6,6 +6,7 @@ mod checkpoint;
 pub mod claude;
 pub mod codex;
 pub(crate) mod continue_instruction;
+pub mod opencode;
 pub(crate) mod repo_config;
 pub(crate) mod section;
 mod session;
@@ -47,7 +48,10 @@ pub enum InputAccounting {
 #[must_use]
 pub fn input_accounting(provider_id: &str) -> Option<InputAccounting> {
     match provider_id {
-        "claude" => Some(InputAccounting::CacheExclusive),
+        // Verified against a real step_finish record: input + output +
+        // cache.read == total, the same cache-exclusive convention Claude
+        // uses.
+        "claude" | "opencode" => Some(InputAccounting::CacheExclusive),
         "codex" => Some(InputAccounting::CacheInclusive),
         _ => None,
     }
@@ -66,6 +70,10 @@ mod accounting_tests {
         assert_eq!(
             input_accounting("codex"),
             Some(InputAccounting::CacheInclusive)
+        );
+        assert_eq!(
+            input_accounting("opencode"),
+            Some(InputAccounting::CacheExclusive)
         );
         // An unrecognised runtime never inherits a convention by default.
         assert_eq!(input_accounting("gemini"), None);

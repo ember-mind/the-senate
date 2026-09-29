@@ -794,6 +794,7 @@ impl ProviderConfig {
 pub enum UniformProvider {
     Claude,
     Codex,
+    Opencode,
     Fake,
 }
 
@@ -810,6 +811,7 @@ impl UniformProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
             Self::Fake => "fake",
         }
     }
@@ -822,6 +824,7 @@ impl TryFrom<&str> for UniformProvider {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "opencode" => Ok(Self::Opencode),
             "fake" => Ok(Self::Fake),
             other => Err(RoutingError::UnsupportedProvider(other.to_owned())),
         }
@@ -865,9 +868,19 @@ impl RetryRoute {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionSelection {
     Uniform(UniformProvider),
+    /// Uniform routing pinned to one explicit model, every role.
+    ///
+    /// A separate variant, not an `Option<ModelId>` field on [`Self::Uniform`],
+    /// so every existing `Uniform(provider)` construction and match arm stays
+    /// untouched: opencode is the first provider whose whole point is picking
+    /// a vendor by model id, so `--provider opencode` without `--model` would
+    /// leave opencode's own CLI default deciding the vendor — the opposite of
+    /// what the flag is for. Claude and Codex accept this too, for the same
+    /// uniform-routing reason `--provider` already applies to every role.
+    UniformWithModel(UniformProvider, ModelId),
     Recommended,
 }
 
@@ -938,6 +951,14 @@ pub fn resolve_config(
 /// Rejects unavailable Recommended, invalid identifiers/configuration, an
 /// effort request naming a role the workflow cannot route, or a grant naming
 /// a role it cannot route.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one function keeps every selection's route/effort/schema derivation together"
+)]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owned selection keeps this public entry point's call sites uniform with resolve_config; the two extra UniformWithModel match arms only borrow it"
+)]
 pub fn resolve_config_with_image(
     selection: ExecutionSelection,
     effort: impl Into<EffortRequest>,
@@ -949,7 +970,7 @@ pub fn resolve_config_with_image(
 ) -> Result<ResolvedConfigSnapshot, RoutingError> {
     let effort = effort.into();
     let roles = routable_roles(workflow);
-    let (profile, profile_version, routes) = match selection {
+    let (profile, profile_version, routes) = match &selection {
         ExecutionSelection::Uniform(provider) => {
             let routes = roles
                 .into_iter()
@@ -959,6 +980,22 @@ pub fn resolve_config_with_image(
                         RouteDto {
                             provider: provider.as_str().to_owned(),
                             model: None,
+                            reason: "explicit_provider".to_owned(),
+                        },
+                    )
+                })
+                .collect();
+            ("uniform", UNIFORM_PROFILE_VERSION, routes)
+        }
+        ExecutionSelection::UniformWithModel(provider, model) => {
+            let routes = roles
+                .into_iter()
+                .map(|role| {
+                    (
+                        role,
+                        RouteDto {
+                            provider: provider.as_str().to_owned(),
+                            model: Some(model.to_string()),
                             reason: "explicit_provider".to_owned(),
                         },
                     )
@@ -984,7 +1021,9 @@ pub fn resolve_config_with_image(
     // otherwise.
     let profile_effort = |role: Role| match selection {
         ExecutionSelection::Recommended => recommended_effort(role),
-        ExecutionSelection::Uniform(_) => EffortSetting::NativeDefault,
+        ExecutionSelection::Uniform(_) | ExecutionSelection::UniformWithModel(_, _) => {
+            EffortSetting::NativeDefault
+        }
     };
     let efforts = match &effort {
         EffortRequest::ProfileDefault => routes
@@ -1374,7 +1413,10 @@ fn decode_v2(
     for (role, route) in payload.routes {
         let provider_id = ProviderId::new(route.provider.clone())
             .map_err(|error| RoutingError::InvalidConfig(error.to_string()))?;
-        if !matches!(provider_id.as_str(), "claude" | "codex" | "fake") {
+        if !matches!(
+            provider_id.as_str(),
+            "claude" | "codex" | "opencode" | "fake"
+        ) {
             return Err(RoutingError::UnsupportedProvider(route.provider));
         }
         if payload.profile == "recommended" && provider_id.as_str() == "fake" {
@@ -1561,6 +1603,12 @@ fn provider_config_dto(provider: &str) -> Result<ProviderConfigDto, RoutingError
             provider_options: codex_options(),
             scenario: None,
         }),
+        "opencode" => Ok(ProviderConfigDto {
+            profile: "native_opencode".to_owned(),
+            schema_version: 1,
+            provider_options: opencode_options(),
+            scenario: None,
+        }),
         "fake" => Ok(ProviderConfigDto {
             profile: "development_fake".to_owned(),
             schema_version: 1,
@@ -1591,6 +1639,13 @@ fn codex_options() -> Value {
         "execution_protocol": "exec_json_v1",
         "sandbox_policy": "stage_kind_v1",
         "approval_policy": "never"
+    })
+}
+
+fn opencode_options() -> Value {
+    json!({
+        "execution_protocol": "run_json_v1",
+        "permission_policy": "stage_kind_v1"
     })
 }
 
