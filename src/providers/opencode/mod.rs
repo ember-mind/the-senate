@@ -22,11 +22,12 @@ use crate::domain::{
     StageKind, StageStatus,
 };
 use crate::engine::{
-    Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal,
+    Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
+    ProviderSignal,
 };
 use crate::process::{
-    ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend, ProcessManager,
-    TmuxBackend,
+    ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
+    ProcessManager, TmuxBackend,
 };
 use crate::providers::{
     PendingProviderAttention, ProviderCommit, ProviderSessionMutation, ProviderSessionRecord,
