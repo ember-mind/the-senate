@@ -618,7 +618,7 @@ fn check_opencode_protection(args: &[String], is_run: bool) -> std::io::Result<(
             return Err(std::io::Error::other("unprotected discovery permissions"));
         }
         if let Some(source) = std::env::var_os("SENATE_FAKE_OPENCODE_SOURCE")
-            && std::env::current_dir()? == std::path::PathBuf::from(source)
+            && std::env::current_dir()? == std::path::Path::new(&source)
         {
             return Err(std::io::Error::other("probe ran in the source checkout"));
         }
