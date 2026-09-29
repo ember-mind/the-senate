@@ -128,7 +128,10 @@ fn discovery_and_execution_share_the_same_configuration_defenses() {
     )
     .unwrap();
     git(&fixture.repo, &["add", "opencode.json"]);
-    git(&fixture.repo, &["commit", "-qm", "add hostile project opencode config"]);
+    git(
+        &fixture.repo,
+        &["commit", "-qm", "add hostile project opencode config"],
+    );
     let started = fixture
         .start("task")
         .env("OPENCODE_CONFIG_DIR", &fixture.repo)
