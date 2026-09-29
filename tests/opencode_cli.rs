@@ -32,7 +32,10 @@ fn native_opencode_fixture_runs_through_tmux_preserves_source_then_applies() {
     assert!(!fixture.repo.join("hello.txt").exists());
     let argv = fs::read_to_string(fixture.capture.join("implementation.argv")).unwrap();
     let stdin = fs::read_to_string(fixture.capture.join("implementation.stdin")).unwrap();
-    assert!(!argv.contains(marker), "the prompt must not be exposed in argv");
+    assert!(
+        !argv.contains(marker),
+        "the prompt must not be exposed in argv"
+    );
     assert!(stdin.contains(marker), "{stdin}");
 
     let applied = fixture.command(&["apply", run_id]).output().unwrap();
@@ -148,7 +151,10 @@ fn primary_subagent_and_legacy_mode_overrides_are_refused_before_launch() {
             .env("SENATE_FAKE_OPENCODE_CONFIG", config.to_string())
             .output()
             .unwrap();
-        assert!(!started.status.success(), "unsafe configuration was accepted");
+        assert!(
+            !started.status.success(),
+            "unsafe configuration was accepted"
+        );
         assert!(
             String::from_utf8_lossy(&started.stderr).contains("permission preflight"),
             "{}",
@@ -243,8 +249,7 @@ fn run_id(stdout: &str) -> &str {
 fn attention_id(stdout: &str) -> String {
     stdout
         .lines()
-        .find_map(|line| {
-            let (id, rest) = line.split_once(" · ")?;
+        .find_map(|line| line.split_once(" · ")?;
             rest.contains("permission").then(|| id.to_owned())
         })
         .expect("a pending permission attention line")

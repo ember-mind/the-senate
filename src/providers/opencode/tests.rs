@@ -138,7 +138,10 @@ impl ProcessBackend for FixtureBackend {
         Ok(())
     }
 
-    fn inspect_session(&self, process: &ManagedProcess) -> Result<BackendSessionState, ProcessError> {
+    fn inspect_session(
+        &self,
+        process: &ManagedProcess,
+    ) -> Result<BackendSessionState, ProcessError> {
         if self.started.lock().unwrap().contains(&process.id()) {
             self.completed.lock().unwrap().insert(process.id());
         }
@@ -412,12 +415,18 @@ fn successful_turn_persists_artifact_usage_and_completes() {
     );
     let artifacts = store.list_artifacts(run_id).unwrap();
     assert_eq!(artifacts.len(), 1);
-    assert_eq!(artifacts[0].metadata().provider_id().unwrap().as_str(), "opencode");
+    assert_eq!(
+        artifacts[0].metadata().provider_id().unwrap().as_str(),
+        "opencode"
+    );
     let content = std::fs::read_to_string(artifacts[0].path()).unwrap();
     assert!(content.contains("# opencode result"));
     drop(store);
     let mut store = SqliteStore::open(database).unwrap();
-    assert_eq!(store.load_run(run_id).unwrap().run.status(), RunStatus::Completed);
+    assert_eq!(
+        store.load_run(run_id).unwrap().run.status(),
+        RunStatus::Completed
+    );
 }
 
 #[test]
@@ -436,13 +445,19 @@ fn large_composed_prompts_are_bound_to_managed_stdin_not_argv() {
     let stdin = std::fs::read_to_string(process.spec().stdin_path().unwrap()).unwrap();
     assert!(stdin.contains(&task));
     assert!(stdin.len() > 128 * 1024);
-    assert!(process.spec().argv().iter().all(|arg| arg.len() < 128 * 1024));
+    assert!(
+        process
+            .spec()
+            .argv()
+            .iter()
+            .all(|arg| arg.len() < 128 * 1024)
+    );
 }
 
 #[test]
 fn a_permission_halt_raises_attention_and_approval_resumes_and_completes() {
-    let backend = FixtureBackend::new(PERMISSION_HALT_OUTPUT)
-        .with_resume(RESUME_AFTER_APPROVAL_OUTPUT);
+    let backend =
+        FixtureBackend::new(PERMISSION_HALT_OUTPUT).with_resume(RESUME_AFTER_APPROVAL_OUTPUT);
     let inspector = backend.clone();
     let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
     let mut engine = WorkflowEngine::new(provider, "fix the bug");
@@ -451,7 +466,12 @@ fn a_permission_halt_raises_attention_and_approval_resumes_and_completes() {
     assert_eq!(session.status(), ProviderSessionStatus::NeedsUser);
     assert_eq!(session.native_session_id().unwrap().as_str(), "ses_A");
     let loaded = store.load_run(run_id).unwrap();
-    let attention = loaded.run.attention_requests().iter().find(|request| request.id() == request_id).unwrap();
+    let attention = loaded
+        .run
+        .attention_requests()
+        .iter()
+        .find(|request| request.id() == request_id)
+        .unwrap();
     assert_eq!(attention.kind(), AttentionKind::Permission);
     assert!(attention.summary().contains("python3 -c"));
     engine
@@ -465,17 +485,39 @@ fn a_permission_halt_raises_attention_and_approval_resumes_and_completes() {
     assert_eq!(invocations.len(), 2);
     assert_eq!(invocations[0].0, 1);
     assert_eq!(invocations[1].0, 2);
-    assert!(invocations[1].1.windows(2).any(|pair| pair[0] == "--session" && pair[1] == "ses_A"));
-    let config_path = temp.path().join("runs").join(run_id.to_string())
-        .join("provider-output").join("opencode").join(session.id().to_string())
+    assert!(
+        invocations[1]
+            .1
+            .windows(2)
+            .any(|pair| pair[0] == "--session" && pair[1] == "ses_A")
+    );
+    let config_path = temp
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("provider-output")
+        .join("opencode")
+        .join(session.id().to_string())
         .join("invocation-2.config.json");
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-    assert_eq!(config["permission"]["bash"]["python3 -c \"from calc import add; assert add(2,3)==5\""], json!("allow"));
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["permission"]["bash"]["python3 -c \"from calc import add; assert add(2,3)==5\""],
+        json!("allow")
+    );
     let resumed = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-    let process = store.load_managed_process(resumed.current_process_id().unwrap()).unwrap();
+    let process = store
+        .load_managed_process(resumed.current_process_id().unwrap())
+        .unwrap();
     let stdin = std::fs::read_to_string(process.spec().stdin_path().unwrap()).unwrap();
     assert!(stdin.contains("The operator approved"));
-    assert!(process.spec().argv().iter().all(|arg| !arg.to_string_lossy().contains("The operator approved")));
+    assert!(
+        process
+            .spec()
+            .argv()
+            .iter()
+            .all(|arg| !arg.to_string_lossy().contains("The operator approved"))
+    );
 }
 
 #[test]
@@ -486,32 +528,65 @@ fn approving_a_compound_denial_grants_every_split_part() {
     let mut engine = WorkflowEngine::new(provider, "fix the bug");
     let request_id = await_attention(&mut engine, &mut store, run_id);
     let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-    engine.resolve_attention_with_response(&mut store, run_id, request_id, None).unwrap();
-    assert_eq!(drive_to_completion(&mut engine, &mut store, run_id), RunStatus::Completed);
-    let config_path = temp.path().join("runs").join(run_id.to_string())
-        .join("provider-output").join("opencode").join(session.id().to_string())
+    engine
+        .resolve_attention_with_response(&mut store, run_id, request_id, None)
+        .unwrap();
+    assert_eq!(
+        drive_to_completion(&mut engine, &mut store, run_id),
+        RunStatus::Completed
+    );
+    let config_path = temp
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("provider-output")
+        .join("opencode")
+        .join(session.id().to_string())
         .join("invocation-2.config.json");
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
     assert_eq!(config["permission"]["bash"]["pwd"], json!("allow"));
     assert_eq!(config["permission"]["bash"]["ls -la"], json!("allow"));
 }
 
 #[test]
 fn a_declined_permission_halt_resumes_without_granting_anything() {
-    let backend = FixtureBackend::new(PERMISSION_HALT_OUTPUT).with_resume(RESUME_AFTER_APPROVAL_OUTPUT);
+    let backend =
+        FixtureBackend::new(PERMISSION_HALT_OUTPUT).with_resume(RESUME_AFTER_APPROVAL_OUTPUT);
     let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
     let mut engine = WorkflowEngine::new(provider, "fix the bug");
     let request_id = await_attention(&mut engine, &mut store, run_id);
     let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-    engine.resolve_attention_with_response(&mut store, run_id, request_id, Some("Continue without running it.")).unwrap();
-    assert_eq!(drive_to_completion(&mut engine, &mut store, run_id), RunStatus::Completed);
-    let config_path = temp.path().join("runs").join(run_id.to_string())
-        .join("provider-output").join("opencode").join(session.id().to_string())
+    engine
+        .resolve_attention_with_response(
+            &mut store,
+            run_id,
+            request_id,
+            Some("Continue without running it."),
+        )
+        .unwrap();
+    assert_eq!(
+        drive_to_completion(&mut engine, &mut store, run_id),
+        RunStatus::Completed
+    );
+    let config_path = temp
+        .path()
+        .join("runs")
+        .join(run_id.to_string())
+        .join("provider-output")
+        .join("opencode")
+        .join(session.id().to_string())
         .join("invocation-2.config.json");
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-    assert_eq!(config["permission"]["bash"].get("python3 -c \"from calc import add; assert add(2,3)==5\""), None);
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["permission"]["bash"].get("python3 -c \"from calc import add; assert add(2,3)==5\""),
+        None
+    );
     let resumed = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-    let process = store.load_managed_process(resumed.current_process_id().unwrap()).unwrap();
+    let process = store
+        .load_managed_process(resumed.current_process_id().unwrap())
+        .unwrap();
     let stdin = std::fs::read_to_string(process.spec().stdin_path().unwrap()).unwrap();
     assert!(stdin.contains("The operator declined"));
     assert!(stdin.contains("Continue without running it."));
@@ -521,7 +596,10 @@ fn a_declined_permission_halt_resumes_without_granting_anything() {
 fn a_vendor_error_fails_the_stage_with_a_scrubbed_message() {
     let (_temp, _database, run_id, mut store, provider) = fixture(INSUFFICIENT_BALANCE_OUTPUT);
     let mut engine = WorkflowEngine::new(provider, "fixture task");
-    assert_eq!(drive_to_completion(&mut engine, &mut store, run_id), RunStatus::Failed);
+    assert_eq!(
+        drive_to_completion(&mut engine, &mut store, run_id),
+        RunStatus::Failed
+    );
     let events = store.load_events(run_id).unwrap();
     assert!(events.iter().any(|event| matches!(
         event.event.kind(),
@@ -539,7 +617,9 @@ fn a_stop_step_after_an_unclean_exit_is_a_recoverable_interruption_not_a_complet
     loop {
         match engine.drive(&mut store, run_id).unwrap() {
             EngineStatus::Interrupted { .. } => break,
-            EngineStatus::Finished { run_status } => panic!("unexpected terminal status: {run_status:?}"),
+            EngineStatus::Finished { run_status } => {
+                panic!("unexpected terminal status: {run_status:?}")
+            }
             EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
             other => panic!("unexpected status: {other:?}"),
         }
@@ -554,27 +634,73 @@ fn a_resumed_invocations_first_record_reports_resumed_not_started() {
     let (_temp, _database, run_id, mut store, mut provider) = fixture(SUCCESS_OUTPUT);
     let workspace = store.load_workspace(run_id).unwrap().unwrap();
     let mut session = ProviderSessionRecord::new(
-        ProviderSessionRecordId::new(), run_id, StageId::new("implementation").unwrap(), 1,
-        ProviderId::new("opencode").unwrap(), PROTOCOL_VERSION, None,
+        ProviderSessionRecordId::new(),
+        run_id,
+        StageId::new("implementation").unwrap(),
+        1,
+        ProviderId::new("opencode").unwrap(),
+        PROTOCOL_VERSION,
+        None,
         OpencodeProvider::<FixtureBackend>::now(),
     );
-    session.activate(ProviderSessionId::new("ses_A").unwrap(), None, OpencodeProvider::<FixtureBackend>::now()).unwrap();
-    let process = provider.manager.prepare_with_input(
-        &mut store, run_id, StageId::new("implementation").unwrap(), 1, 2,
-        Path::new("/bin/true"), vec![], BTreeMap::new(), &[],
-    ).unwrap();
-    session.bind_process(process.id(), 2, OpencodeProvider::<FixtureBackend>::now()).unwrap();
+    session
+        .activate(
+            ProviderSessionId::new("ses_A").unwrap(),
+            None,
+            OpencodeProvider::<FixtureBackend>::now(),
+        )
+        .unwrap();
+    let process = provider
+        .manager
+        .prepare_with_input(
+            &mut store,
+            run_id,
+            StageId::new("implementation").unwrap(),
+            1,
+            2,
+            Path::new("/bin/true"),
+            vec![],
+            BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
+    session
+        .bind_process(process.id(), 2, OpencodeProvider::<FixtureBackend>::now())
+        .unwrap();
     let request = ProviderRequest::new(
-        run_id, StageId::new("implementation").unwrap(), StageKind::Implementation,
-        StageStatus::Running, Role::Implementer, "fixture task".to_owned(),
-        workspace.worktree_path().to_path_buf(), 1, 1,
-        Some(ProviderSessionId::new("ses_A").unwrap()), vec![],
+        run_id,
+        StageId::new("implementation").unwrap(),
+        StageKind::Implementation,
+        StageStatus::Running,
+        Role::Implementer,
+        "fixture task".to_owned(),
+        workspace.worktree_path().to_path_buf(),
+        1,
+        1,
+        Some(ProviderSessionId::new("ses_A").unwrap()),
+        vec![],
     );
-    let event = OpencodeEvent { session_id: "ses_A".to_owned(), kind: OpencodeKind::StepStart };
+    let event = OpencodeEvent {
+        session_id: "ses_A".to_owned(),
+        kind: OpencodeKind::StepStart,
+    };
     let chunk = OutputChunk::new(process.id(), OutputStream::Stdout, 0, 0, Vec::new()).unwrap();
-    let poll = provider.map_record(&mut store, &request, session, chunk, 0, event, ManagedProcessStatus::Preparing, false).unwrap();
+    let poll = provider
+        .map_record(
+            &mut store,
+            &request,
+            session,
+            chunk,
+            0,
+            event,
+            ManagedProcessStatus::Preparing,
+            false,
+        )
+        .unwrap();
     match poll {
-        ProviderPoll::Emission { signals, .. } => assert_eq!(signals, vec![ProviderSignal::Resumed]),
+        ProviderPoll::Emission { signals, .. } => {
+            assert_eq!(signals, vec![ProviderSignal::Resumed])
+        }
         other => panic!("expected an Emission carrying Resumed, got {other:?}"),
     }
 }

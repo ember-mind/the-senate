@@ -3,9 +3,9 @@
 //! Native opencode 1.18.33 reads piped input with `Bun.stdin.text()`. Stage
 //! prompts therefore use the same run-private immutable stdin transport as
 //! the other providers, never argv (which exposes prompts and has per-string
-//! operating-system limits independent of ARG_MAX).
+//! operating-system limits independent of `ARG_MAX`).
 //!
-//! OPENCODE_PERMISSION overrides global permissions, but not per-agent rules.
+//! `OPENCODE_PERMISSION` overrides global permissions, but not per-agent rules.
 //! The adapter audits resolved native configuration before launch and refuses
 //! agent/mode permission overrides. Both discovery and execution disable
 //! project configuration and external plugins. Native global configuration
@@ -91,7 +91,7 @@ impl OpencodeSandbox {
     }
 }
 
-/// Converts the shared Claude Bash(<prefix>:*) allowlist to native glob rules.
+/// Converts the shared Claude `Bash(<prefix>:*)` allowlist to native glob rules.
 /// Non-bash rules and unrecognized shapes are skipped, never guessed at.
 /// This retains the existing Claude baseline, including find/sed/awk and its
 /// associated shell-command risks; it is not an operating-system sandbox.
@@ -370,6 +370,7 @@ mod tests {
                 StageKind::Review,
                 None,
                 setting,
+                EffortSetting::NativeDefault,
                 Path::new("/managed/worktree"),
                 Path::new("/private/config.json"),
                 &sample_permission(),
@@ -482,7 +483,10 @@ mod tests {
             let decoded: Value = serde_json::from_str(&permission.to_string_lossy()).unwrap();
             assert_eq!(decoded, sample_permission());
             for name in ["OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"] {
-                assert_eq!(command.environment.get(&OsString::from(name)), Some(&OsString::new()));
+                assert_eq!(
+                    command.environment.get(&OsString::from(name)),
+                    Some(&OsString::new())
+                );
             }
         }
     }
@@ -499,8 +503,14 @@ mod tests {
             &sample_permission(),
         );
         let args = strings(&command.argv);
-        assert!(args.windows(2).any(|pair| pair == ["-m", "opencode-go/deepseek-v4-pro"]));
-        assert!(args.windows(2).any(|pair| pair == ["--dir", "/managed/worktree"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-m", "opencode-go/deepseek-v4-pro"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--dir", "/managed/worktree"])
+        );
         assert!(!args.iter().any(|arg| arg == "--auto"));
     }
 
@@ -547,7 +557,11 @@ mod tests {
             StageKind::Fix,
             StageKind::FollowUp,
         ] {
-            assert_eq!(OpencodeSandbox::for_stage(kind), OpencodeSandbox::WorkspaceWrite, "{kind:?}");
+            assert_eq!(
+                OpencodeSandbox::for_stage(kind),
+                OpencodeSandbox::WorkspaceWrite,
+                "{kind:?}"
+            );
         }
         for kind in [
             StageKind::Research,
@@ -558,17 +572,24 @@ mod tests {
             StageKind::Decision,
             StageKind::Verify,
         ] {
-            assert_eq!(OpencodeSandbox::for_stage(kind), OpencodeSandbox::ReadOnly, "{kind:?}");
+            assert_eq!(
+                OpencodeSandbox::for_stage(kind),
+                OpencodeSandbox::ReadOnly,
+                "{kind:?}"
+            );
         }
     }
 
     #[test]
     fn read_only_config_matches_the_verified_real_shape() {
         let config = OpencodeSandbox::ReadOnly.permission_config(&BTreeMap::new());
-        assert_eq!(config, json!({
-            "$schema": "https://opencode.ai/config.json",
-            "permission": {"edit":"deny", "bash":"deny", "webfetch":"deny", "external_directory":"deny"}
-        }));
+        assert_eq!(
+            config,
+            json!({
+                "$schema": "https://opencode.ai/config.json",
+                "permission": {"edit":"deny", "bash":"deny", "webfetch":"deny", "external_directory":"deny"}
+            })
+        );
     }
 
     #[test]
@@ -588,7 +609,10 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         let patterns = bash_allow_patterns(worktree.path(), None).unwrap();
         assert_eq!(patterns.get("grep *").map(String::as_str), Some("allow"));
-        assert_eq!(patterns.get("git status *").map(String::as_str), Some("allow"));
+        assert_eq!(
+            patterns.get("git status *").map(String::as_str),
+            Some("allow")
+        );
         assert!(!patterns.contains_key("Edit *"));
     }
 
@@ -601,7 +625,10 @@ mod tests {
         )
         .unwrap();
         let patterns = bash_allow_patterns(worktree.path(), None).unwrap();
-        assert_eq!(patterns.get("cargo test *").map(String::as_str), Some("allow"));
+        assert_eq!(
+            patterns.get("cargo test *").map(String::as_str),
+            Some("allow")
+        );
     }
 
     #[test]
@@ -612,8 +639,17 @@ mod tests {
 
     #[test]
     fn exact_bash_pattern_refuses_glob_syntax_that_would_widen_the_grant() {
-        for command in ["rm *.txt", "cat file?.log", "ls [ab]*", "echo {a,b}", "echo \\x"] {
-            assert!(exact_bash_pattern(command).is_err(), "{command} must be refused");
+        for command in [
+            "rm *.txt",
+            "cat file?.log",
+            "ls [ab]*",
+            "echo {a,b}",
+            "echo \\x",
+        ] {
+            assert!(
+                exact_bash_pattern(command).is_err(),
+                "{command} must be refused"
+            );
         }
         assert!(exact_bash_pattern("").is_err());
         assert!(exact_bash_pattern("   ").is_err());
@@ -621,30 +657,55 @@ mod tests {
 
     #[test]
     fn split_top_level_commands_matches_opencodes_own_split_of_a_real_denied_command() {
-        assert_eq!(split_top_level_commands("pwd && ls -la"), Some(vec!["pwd".to_owned(), "ls -la".to_owned()]));
+        assert_eq!(
+            split_top_level_commands("pwd && ls -la"),
+            Some(vec!["pwd".to_owned(), "ls -la".to_owned()])
+        );
     }
 
     #[test]
     fn split_top_level_commands_handles_every_top_level_separator() {
-        assert_eq!(split_top_level_commands("a || b; c | d\ne"), Some(vec![
-            "a".to_owned(), "b".to_owned(), "c".to_owned(), "d".to_owned(), "e".to_owned()
-        ]));
+        assert_eq!(
+            split_top_level_commands("a || b; c | d\ne"),
+            Some(vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+                "e".to_owned()
+            ])
+        );
     }
 
     #[test]
     fn split_top_level_commands_never_splits_inside_quotes() {
-        assert_eq!(split_top_level_commands("echo 'a && b' && echo \"c ; d\""), Some(vec![
-            "echo 'a && b'".to_owned(), "echo \"c ; d\"".to_owned()
-        ]));
+        assert_eq!(
+            split_top_level_commands("echo 'a && b' && echo \"c ; d\""),
+            Some(vec![
+                "echo 'a && b'".to_owned(),
+                "echo \"c ; d\"".to_owned()
+            ])
+        );
     }
 
     #[test]
     fn split_top_level_commands_fails_closed_on_ambiguous_shell() {
         for command in [
-            "echo `whoami`", "echo $(whoami)", "echo 'unterminated", "echo \"unterminated",
-            "{ echo a; }", "echo a > out.txt", "cat < in.txt", "echo a &&", "&& echo a",
+            "echo `whoami`",
+            "echo $(whoami)",
+            "echo 'unterminated",
+            "echo \"unterminated",
+            "{ echo a; }",
+            "echo a > out.txt",
+            "cat < in.txt",
+            "echo a &&",
+            "&& echo a",
         ] {
-            assert_eq!(split_top_level_commands(command), None, "{command} must be refused as ambiguous");
+            assert_eq!(
+                split_top_level_commands(command),
+                None,
+                "{command} must be refused as ambiguous"
+            );
         }
     }
 
@@ -656,7 +717,10 @@ mod tests {
 
     #[test]
     fn exact_bash_patterns_grants_each_split_part_of_a_compound_command() {
-        assert_eq!(exact_bash_patterns("pwd && ls -la").unwrap(), vec!["pwd".to_owned(), "ls -la".to_owned()]);
+        assert_eq!(
+            exact_bash_patterns("pwd && ls -la").unwrap(),
+            vec!["pwd".to_owned(), "ls -la".to_owned()]
+        );
     }
 
     #[test]
@@ -667,6 +731,8 @@ mod tests {
     }
 
     fn strings(argv: &[OsString]) -> Vec<String> {
-        argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
+        argv.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 }

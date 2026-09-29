@@ -9,8 +9,7 @@ use super::command::MAX_PROMPT_BYTES;
 
 const MAX_DEPENDENCY_BYTES: u64 = 256 * 1024;
 
-/// Heading the operator-instruction section always opens with, shared by its
-/// renderer and the tests that compute the same overhead it does.
+/// Heading shared by the renderer and tests that compute its overhead.
 const OPERATOR_INSTRUCTION_HEADER: &str = "\n# Operator instruction\n";
 
 pub(crate) fn compose(
@@ -38,7 +37,7 @@ pub(crate) fn compose(
     .expect("String writes cannot fail");
     writeln!(
         prompt,
-        "You are executing one stage for The Senate. Work only inside current managed worktree. Respect repository instructions, AGENTS.md, rules, skills, and native opencode configuration discovered normally. Do not apply changes to another checkout. Do not invoke The Senate apply. Do not commit or push. Return concise Markdown describing result, evidence, and unresolved risks."
+        "You are executing one stage for The Senate. Work only inside current managed worktree. Respect repository instructions, AGENTS.md, rules, skills, and the Senate-enforced native permission policy. Do not apply changes to another checkout. Do not invoke The Senate apply. Do not commit or push. Return concise Markdown describing result, evidence, and unresolved risks."
     )
     .expect("String writes cannot fail");
     writeln!(prompt, "{}", stage_prompt::BOTTOM_LINE).expect("String writes cannot fail");
@@ -78,9 +77,8 @@ pub(crate) fn compose(
         )
         .expect("String writes cannot fail");
     }
-    // Same immutable run-private path an attention response or Codex's
-    // follow-up prompt uses, never argv beyond this composed prompt itself
-    // and never a domain event payload.
+    // This composed prompt is persisted as immutable run-private stdin,
+    // never argv or a domain event payload.
     if let Some(instruction) = continue_instruction {
         let room = MAX_PROMPT_BYTES.saturating_sub(prompt.len());
         let section = continue_instruction_within(instruction, room);
@@ -92,9 +90,8 @@ pub(crate) fn compose(
         prompt.push_str(&section);
     }
     if let Some(handoff) = handoff {
-        // The change map is navigation aid, not source of truth, so it yields
-        // whatever room the rest of the prompt left — same discipline Codex's
-        // prompt uses, at opencode's tighter argv-safety ceiling.
+        // Navigation evidence yields to required context under the resource
+        // limit; this is not an operating-system argument-size restriction.
         let room = MAX_PROMPT_BYTES.saturating_sub(prompt.len());
         prompt.push_str(&change_handoff::render_within(handoff, room));
     }
@@ -104,10 +101,8 @@ pub(crate) fn compose(
     Ok(prompt)
 }
 
-/// Renders the operator-instruction section so it fits inside `max_bytes`,
-/// truncating the instruction text itself rather than silently dropping the
-/// section or letting the composed prompt exceed opencode's argv-safety
-/// ceiling. Mirrors Codex's own `continue_instruction_within`.
+/// Fits the operator instruction into the remaining prompt resource budget,
+/// explicitly marking truncation rather than silently omitting the section.
 fn continue_instruction_within(instruction: &str, max_bytes: usize) -> String {
     let full = format!("{OPERATOR_INSTRUCTION_HEADER}{instruction}\n");
     if full.len() <= max_bytes {
@@ -132,13 +127,11 @@ fn continue_instruction_within(instruction: &str, max_bytes: usize) -> String {
 
 fn incomplete_marker(shown: usize, total: usize) -> String {
     format!(
-        "\nCompleteness: INCOMPLETE — the operator's instruction exceeds opencode's argv-safety limit here ({shown} of {total} instruction bytes shown). Treat this as a partial instruction; the rest was not delivered.\n"
+        "\nCompleteness: INCOMPLETE — the operator's instruction exceeds the prompt resource limit here ({shown} of {total} instruction bytes shown). Treat this as a partial instruction; the rest was not delivered.\n"
     )
 }
 
-/// opencode has no dedicated resume-continuation grammar of its own; this
-/// mirrors Codex's, since both continue same native session state and both
-/// need the operator's stage kind restated rather than re-sent context.
+/// Restates the assigned stage when continuing the same native session.
 pub(crate) fn continuation(request: &ProviderRequest) -> String {
     format!(
         "Continue exact interrupted stage {} for The Senate in same native opencode session. Finish assigned {:?} work in current managed worktree. {} Do not commit, push, or apply changes to another checkout. Return final Markdown result.",
@@ -232,9 +225,7 @@ mod tests {
         assert_eq!(with.len(), without.len() + section.len());
     }
 
-    /// opencode has no stdin/file alternative to argv for the prompt, so an
-    /// oversized change map is shortened to opencode's tighter ceiling rather
-    /// than allowed to grow the argv without bound.
+    /// Large context is still bounded even though delivery no longer uses argv.
     #[test]
     fn a_change_map_larger_than_the_prompt_ceiling_is_shortened_to_fit() {
         let diff_text = "+padding line of diff text to overflow the input\n".repeat(25_000);

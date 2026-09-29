@@ -451,8 +451,8 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
             return Ok(());
         }
         ["debug", "config"] => {
-            let config = std::env::var("SENATE_FAKE_OPENCODE_CONFIG")
-                .unwrap_or_else(|_| "{}".to_owned());
+            let config =
+                std::env::var("SENATE_FAKE_OPENCODE_CONFIG").unwrap_or_else(|_| "{}".to_owned());
             writeln!(std::io::stdout(), "{config}")?;
             return Ok(());
         }
@@ -612,9 +612,8 @@ fn check_opencode_protection(args: &[String], is_run: bool) -> std::io::Result<(
         return Err(std::io::Error::other("unprotected opencode invocation"));
     }
     if !is_run {
-        let permission: serde_json::Value = serde_json::from_str(
-            &std::env::var("OPENCODE_PERMISSION").unwrap_or_default(),
-        )?;
+        let permission: serde_json::Value =
+            serde_json::from_str(&std::env::var("OPENCODE_PERMISSION").unwrap_or_default())?;
         if permission["edit"] != "deny" || permission["bash"] != "deny" {
             return Err(std::io::Error::other("unprotected discovery permissions"));
         }

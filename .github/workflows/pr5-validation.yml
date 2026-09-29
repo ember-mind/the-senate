@@ -1,0 +1,103 @@
+name: PR 5 validation (temporary)
+on:
+  push:
+    branches: [opencode-provider]
+permissions:
+  contents: write
+concurrency:
+  group: opencode-review-validation
+  cancel-in-progress: false
+jobs:
+  validate:
+    if: github.repository == 'ember-mind/the-senate' && github.ref == 'refs/heads/opencode-provider'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply final source corrections
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/providers/opencode/command.rs')
+          text = p.read_text()
+          old = '                setting,\n                EffortSetting::NativeDefault,\n'
+          assert text.count(old) == 1, 'expected one duplicated test argument'
+          p.write_text(text.replace(old, '                setting,\n'))
+          p = Path('tests/opencode_cli.rs')
+          text = p.read_text()
+          old = '        .find_map(|line| line.split_once(" · ")?;\n'
+          assert text.count(old) == 1, 'expected attention helper correction'
+          p.write_text(text.replace(old, '        .find_map(|line| {\n            let (id, rest) = line.split_once(" · ")?;\n'))
+          p = Path('ARCHITECTURE.md')
+          lines = p.read_text().splitlines()
+          for i, line in enumerate(lines):
+              if line.startswith("opencode's `run --help`"):
+                  lines[i] = "OpenCode v1.18.33 supports piped stdin (`Bun.stdin.text()` for non-terminal input). Both initial and continuation prompts use the process manager's immutable stdin path and digest, not argv or environment. The 256 KiB composed-context ceiling is a resource budget, not an `ARG_MAX` guarantee; navigation evidence yields before required context. Large-prompt regression tests exercise input exceeding Linux's per-argument limit."
+              elif line.startswith('Permissions travel through a per-invocation JSON file'):
+                  lines[i] = "Permissions travel through a per-invocation `OPENCODE_CONFIG` file and an `OPENCODE_PERMISSION` overlay. Every execution and discovery probe also uses `--pure`, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, and clears ambient `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT`; probes run in a private neutral directory with empty stdin. Model discovery initializes plugins too, so these defenses apply before `opencode models`, not just at `run`. Native global configuration and vendor authentication remain available. Crucially, native agent permissions are applied after global permissions: the adapter audits resolved `opencode debug config --pure` output and refuses nonempty per-agent or legacy-mode permission/tools overrides, including delegated agents, before discovery proceeds and again before every initial/resumed/recovered launch. It never rewrites user configuration or persists its contents. Read-only stages deny edit, bash, webfetch and external-directory access; Implementation/Simplification/Fix/FollowUp allow edit and use the shared Claude bash allowlist plus exact operator-approved commands, with all other bash requests asking. Native tool permissions are not an operating-system sandbox. See `docs/features/providers.md` for compatibility limits and regression coverage."
+              elif line.startswith("- opencode's stage prompt travels as argv"):
+                  lines[i] = "- opencode stage and continuation prompts use immutable stdin, never argv or environment; the composed-context cap is a resource limit, not an operating-system argument limit."
+              elif line.startswith("- `OPENCODE_CONFIG` is not opencode's enforcement authority"):
+                  lines[i] = "- opencode discovery and execution share project-config/plugin restrictions. `OPENCODE_PERMISSION` overlays global permissions but not per-agent rules; resolved agent/mode permission overrides are refused before each launch, including resume and recovery."
+              elif line.startswith('`OpencodeProvider` drives '):
+                  lines[i] = line.replace('"<prompt>"', '(prompt on immutable stdin)').replace('Native `opencode --version`, `auth login`/`auth list`, and `opencode models` remain the sole authentication and discovery surface (`~/.local/share/opencode/auth.json`);', 'Native opencode remains the authentication and model-discovery authority, including stored credentials, environment credentials and configured local providers; readiness follows its available-model catalogue rather than the credential-count text;')
+          p.write_text('\n'.join(lines) + '\n')
+          PY
+      - name: Format and apply compiler-provided lint corrections
+        run: |
+          cargo fmt
+          cargo clippy --fix --allow-dirty --allow-staged --all-targets --all-features -- -D warnings
+        continue-on-error: true
+      - name: Store formatted candidate without updating any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo fmt
+          python3 - <<'PY'
+          import base64, json, os, subprocess, urllib.request
+          from pathlib import Path
+          helper = '.github/workflows/pr5-validation.yml'
+          Path(helper).unlink()
+          paths = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {helper, 'ARCHITECTURE.md', 'docs/features/providers.md', 'src/bin/senate-test-agent.rs', 'tests/opencode_cli.rs'}
+          assert all(p in allowed or p.startswith('src/providers/opencode/') for p in paths), paths
+          root = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY']
+          def request(path, data=None):
+              req = urllib.request.Request(root + path, data=None if data is None else json.dumps(data).encode(), headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'X-GitHub-Api-Version': '2022-11-28'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+          parent = os.environ['GITHUB_SHA']
+          tree = request('/git/commits/' + parent)['tree']['sha']
+          entries = []
+          for path in paths:
+              p = Path(path)
+              sha = None
+              if p.exists():
+                  sha = request('/git/blobs', {'content': base64.b64encode(p.read_bytes()).decode(), 'encoding': 'base64'})['sha']
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': sha})
+          tree = request('/git/trees', {'base_tree': tree, 'tree': entries})['sha']
+          commit = request('/git/commits', {'message': 'Format opencode review fixes and align architecture documentation', 'tree': tree, 'parents': [parent]})['sha']
+          print('FORMATTED_CANDIDATE_COMMIT=' + commit)
+          print('FORMATTED_CANDIDATE_TREE=' + tree)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Formatted candidate: `' + commit + '`\n\nThe temporary validation workflow is removed from this candidate. No branch was updated by the job.\n')
+          PY
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install --yes tmux
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run provider regression tests
+        run: cargo test providers::opencode && cargo test --test opencode_cli
+      - name: Run complete test suite
+        run: cargo test --test process_tmux --no-fail-fast && cargo test
+      - name: Check minimum supported Rust
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          cargo +1.88.0 check --all-targets --locked

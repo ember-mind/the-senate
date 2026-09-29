@@ -91,7 +91,7 @@ impl OpencodeInstallation {
     /// Rejects native agent/mode overrides before every managed invocation.
     ///
     /// In opencode 1.18.33 agent permissions are appended *after* the global
-    /// permission object, including OPENCODE_PERMISSION. Inspect the resolved
+    /// permission object, including `OPENCODE_PERMISSION`. Inspect the resolved
     /// configuration (which includes global Markdown agents and legacy modes)
     /// rather than claiming that the global environment override wins. Check
     /// every agent, not just the primary agent: task subagents must not bypass
@@ -112,8 +112,9 @@ impl OpencodeInstallation {
         if !output.status.success() {
             return Err(permission_error("native configuration inspection failed"));
         }
-        let config: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_| permission_error("native configuration inspection returned invalid JSON"))?;
+        let config: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            permission_error("native configuration inspection returned invalid JSON")
+        })?;
         validate_permission_config(&config)
     }
 
@@ -171,9 +172,9 @@ fn validate_permission_config(config: &Value) -> Result<(), OpencodeProviderErro
         let Some(value) = config.get(table) else {
             continue;
         };
-        let agents = value
-            .as_object()
-            .ok_or_else(|| permission_error("resolved agent/mode configuration is not an object"))?;
+        let agents = value.as_object().ok_or_else(|| {
+            permission_error("resolved agent/mode configuration is not an object")
+        })?;
         for agent in agents.values() {
             let settings = agent
                 .as_object()
@@ -214,6 +215,7 @@ fn command_output(executable: &Path, args: &[&str]) -> std::io::Result<Output> {
             .args(args)
             .arg("--pure")
             .envs(&environment)
+            .env("PWD", directory.path())
             .current_dir(directory.path())
             .stdin(Stdio::null())
             .output()
@@ -338,7 +340,11 @@ mod tests {
     fn primary_subagent_and_legacy_mode_overrides_are_all_refused() {
         for table in ["agent", "mode"] {
             for name in ["build", "general", "explore", "custom"] {
-                for overrides in [json!("allow"), json!({"edit":"allow"}), json!({"bash":"allow"})] {
+                for overrides in [
+                    json!("allow"),
+                    json!({"edit":"allow"}),
+                    json!({"bash":"allow"}),
+                ] {
                     let mut config = json!({});
                     config[table] = json!({});
                     config[table][name] = json!({"permission": overrides});
@@ -363,7 +369,11 @@ mod tests {
 
     #[test]
     fn malformed_configuration_fails_closed_without_echoing_contents() {
-        for config in [json!(null), json!({"agent": []}), json!({"agent":{"SECRET": "SECRET"}})] {
+        for config in [
+            json!(null),
+            json!({"agent": []}),
+            json!({"agent":{"SECRET": "SECRET"}}),
+        ] {
             let error = validate_permission_config(&config).unwrap_err().to_string();
             assert!(!error.contains("SECRET"));
         }
