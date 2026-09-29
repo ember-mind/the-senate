@@ -699,7 +699,7 @@ fn a_resumed_invocations_first_record_reports_resumed_not_started() {
         .unwrap();
     match poll {
         ProviderPoll::Emission { signals, .. } => {
-            assert_eq!(signals, vec![ProviderSignal::Resumed])
+            assert_eq!(signals, vec![ProviderSignal::Resumed]);
         }
         other => panic!("expected an Emission carrying Resumed, got {other:?}"),
     }
