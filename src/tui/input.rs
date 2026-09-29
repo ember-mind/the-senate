@@ -60,6 +60,8 @@ pub(crate) enum Intent {
     TechnicalDetails,
     /// Open the campaign's 3D view in the browser.
     EnterSenate,
+    /// Open the campaign's factual progress brief in the browser.
+    OpenRecap,
     Help,
     Character(char),
     /// Decline the selected permission request and let the task continue.
@@ -98,6 +100,7 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('S') => Intent::StartPackage,
         KeyCode::Char('I') => Intent::Integrate,
         KeyCode::Char('W') => Intent::EnterSenate,
+        KeyCode::Char('B') => Intent::OpenRecap,
         KeyCode::Char('r') => Intent::Resume,
         KeyCode::Char('t') => Intent::Retry,
         KeyCode::Char('s') => Intent::Stop,

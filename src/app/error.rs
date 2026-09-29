@@ -11,9 +11,12 @@ use crate::store::{RunInputError, StoreError};
 use crate::workspace::WorkspaceError;
 
 use super::RoutingError;
+use super::mission_brief::BriefError;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error(transparent)]
+    Brief(#[from] BriefError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

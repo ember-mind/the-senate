@@ -4,6 +4,7 @@
 //! a sentence for the footer instead of a panic.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Opens `url` with the platform's default browser.
@@ -20,6 +21,29 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
     for program in candidates {
         match Command::new(program)
             .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(source) => last = format!("{program}: {source}"),
+        }
+    }
+    Err(last)
+}
+
+/// Opens an existing local HTML file without constructing a file URL.
+pub(crate) fn open_local_file(path: &Path) -> Result<(), String> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["open"]
+    } else {
+        &["xdg-open", "wslview"]
+    };
+    let mut last = String::from("no browser opener found");
+    for program in candidates {
+        match Command::new(program)
+            .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

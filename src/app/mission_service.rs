@@ -24,6 +24,7 @@ use crate::store::{
 };
 use crate::workspace::WorkspaceStatus;
 
+use super::mission_brief;
 use super::mission_lead::{self, LeadAnswer, LeadTurn};
 use super::mission_query::{self, MissionDetails, MissionListItem};
 use super::mission_result;
@@ -139,6 +140,22 @@ impl MissionService {
         mission_query::details(&mut store, &loaded)
     }
 
+    /// Opens a stable local recap of the mission's committed evidence.
+    /// Optional images are copied into that recap, never loaded from a
+    /// remote URL. The lead's last answer is labelled as narrative.
+    ///
+    /// # Errors
+    /// Returns mission, artifact, visual-input, or filesystem errors.
+    pub fn open_recap(
+        &self,
+        mission_id: MissionId,
+        visual_paths: &[PathBuf],
+    ) -> Result<PathBuf, AppError> {
+        let details = self.inspect_mission(mission_id)?;
+        let mut store = SqliteStore::open(&self.database)?;
+        write_recap(&mut store, &details, visual_paths)
+    }
+
     /// One exchange with the mission's lead. The first message starts the
     /// lead session as a run over the mission's checkout; every later one
     /// appends a turn to it. Each turn's instruction is the brief rendered
@@ -233,6 +250,14 @@ impl MissionService {
         let answer = mission_lead::latest_answer(&mut store, report.details.id)?;
         drop(store);
         let details = self.inspect_mission(mission_id)?;
+        if answer.as_ref().is_some_and(|answer| {
+            answer
+                .proposals
+                .as_ref()
+                .is_ok_and(|changes| !changes.is_empty())
+        }) {
+            self.auto_recap(&details, "lead decision request");
+        }
         Ok((LeadTurn { report, answer }, details))
     }
 
@@ -755,9 +780,11 @@ impl MissionService {
                 });
             }
         };
-        self.mutate(mission_id, |mission, now| {
+        let details = self.mutate(mission_id, |mission, now| {
             mission.integrate_package(package_id, evidence, now)
-        })
+        })?;
+        self.auto_recap(&details, "package integrated");
+        Ok(details)
     }
 
     /// Returns a failed package to the plan so a new run can serve it.
@@ -813,7 +840,9 @@ impl MissionService {
     /// # Errors
     /// Returns domain rule violations or persistence errors.
     pub fn complete_mission(&self, mission_id: MissionId) -> Result<MissionDetails, AppError> {
-        self.mutate(mission_id, Mission::complete)
+        let details = self.mutate(mission_id, Mission::complete)?;
+        self.auto_recap(&details, "mission completed");
+        Ok(details)
     }
 
     /// Cancels a mission and every open package; running packages must be
@@ -852,6 +881,38 @@ impl MissionService {
         }
         mission_query::details(&mut store, &loaded)
     }
+
+    fn auto_recap(&self, details: &MissionDetails, trigger: &str) {
+        let outcome = SqliteStore::open(&self.database)
+            .map_err(AppError::from)
+            .and_then(|mut store| write_recap(&mut store, details, &[]));
+        if let Err(error) = outcome {
+            tracing::warn!(mission = %details.id, trigger, %error, "could not write automatic mission recap");
+        }
+    }
+}
+
+fn write_recap(
+    store: &mut SqliteStore,
+    details: &MissionDetails,
+    visual_paths: &[PathBuf],
+) -> Result<PathBuf, AppError> {
+    let answer = match details.lead.as_ref() {
+        Some(lead) => mission_lead::latest_answer(store, lead.run_id)?,
+        None => None,
+    };
+    let database = store
+        .database_path()
+        .ok_or_else(|| AppError::Brief(mission_brief::BriefError::NoDataDirectory))?;
+    let data_dir = database
+        .parent()
+        .ok_or_else(|| AppError::Brief(mission_brief::BriefError::NoDataDirectory))?;
+    Ok(mission_brief::write(
+        data_dir,
+        details,
+        answer.as_ref(),
+        visual_paths,
+    )?)
 }
 
 fn now() -> DateTime<Utc> {
@@ -887,6 +948,7 @@ fn observe_runs(
         })
         .collect();
     let mut events = Vec::new();
+    let mut decision_requested = false;
     for (package_id, run_id, package_status) in observed {
         let run = store.load_run(run_id)?.run;
         let status = run.status();
@@ -899,6 +961,16 @@ fn observe_runs(
             RunStatus::Failed => query::inspect(store, run_id)?.failure_reason,
             _ => None,
         };
+        if status == RunStatus::NeedsUser
+            && (package_status != WorkPackageStatus::Blocked
+                || loaded
+                    .mission
+                    .package(&package_id)
+                    .and_then(WorkPackage::reason)
+                    != reason.as_deref())
+        {
+            decision_requested = true;
+        }
         let now = now().max(*loaded.mission.updated_at());
         let delivered_stages = loaded
             .mission
@@ -926,6 +998,13 @@ fn observe_runs(
     }
     if !events.is_empty() {
         loaded.revision = store.commit_mission_update(&loaded.mission, loaded.revision, &events)?;
+        if decision_requested {
+            let outcome = mission_query::details(store, &loaded)
+                .and_then(|details| write_recap(store, &details, &[]));
+            if let Err(error) = outcome {
+                tracing::warn!(mission = %mission_id, %error, "could not write decision-request recap");
+            }
+        }
     }
     Ok(loaded)
 }
@@ -1332,6 +1411,21 @@ mod tests {
             std::fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
             "changed by the package\n"
         );
+        let briefs = fixture
+            .database
+            .parent()
+            .unwrap()
+            .join("missions")
+            .join(mission.id.to_string())
+            .join("briefs");
+        assert!(std::fs::read_dir(briefs).unwrap().next().is_some());
+        let recap = missions.open_recap(mission.id, &[]).unwrap();
+        assert!(recap.exists());
+        let html = std::fs::read_to_string(recap).unwrap();
+        assert!(html.contains("Core"));
+        // This test edits the worktree after Fake already delivered; the
+        // recap quotes captured delivery evidence, not later filesystem state.
+        assert!(!html.contains("README.md"));
     }
 
     #[test]

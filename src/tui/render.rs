@@ -894,6 +894,7 @@ fn campaign_actions_line(state: &TuiState) -> Line<'static> {
     // thing that belongs to the whole campaign.
     let _ = state;
     push("W", "Enter the Senate", theme::muted_color());
+    push("B", "Open recap", theme::muted_color());
     Line::from(spans)
 }
 
@@ -2519,6 +2520,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
         Screen::Missions => {
             push("Enter", "Open", theme::accent());
             push("W", "Enter the Senate", theme::muted_color());
+            push("B", "Open recap", theme::muted_color());
             push("R", "Runs", theme::muted_color());
         }
         Screen::MissionDetail => mission_detail_actions(state, &mut push),
@@ -2537,6 +2539,7 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
 fn mission_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)) {
     selected_order_actions(state, push);
     push("W", "Enter the Senate", theme::muted_color());
+    push("B", "Open recap", theme::muted_color());
 }
 
 /// What the selected Order can take right now, plus the campaign's own
@@ -2687,7 +2690,7 @@ u attention · A approve · l logs · e task · d diff
 a apply · b rebase · P PR · X discard
 f cycle · c/w continue · i technical
 Campaign  ↑↓/j/k Orders · Enter run · S start
-u answer · I bring in · A approve · W Senate
+u answer · I bring in · A approve · W Senate · B recap
 Runs  h archive · H archived · D delete
 Text  Ctrl-U/K/W/Alt-Backspace edit
 Artifact  m raw/rendered";

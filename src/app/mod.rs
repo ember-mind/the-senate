@@ -1,6 +1,7 @@
 //! Application use cases coordinating domain, persistence, Git, and providers.
 
 mod error;
+mod mission_brief;
 mod mission_lead;
 pub(crate) mod mission_query;
 mod mission_result;

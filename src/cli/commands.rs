@@ -762,6 +762,18 @@ fn mission(command: &MissionCommand) -> Result<()> {
             print_mission(&missions.inspect_mission(*mission_id)?);
             Ok(())
         }
+        MissionCommand::Recap {
+            mission_id,
+            visuals,
+            open,
+        } => {
+            let path = missions.open_recap(*mission_id, visuals)?;
+            println!("Recap: {}", path.display());
+            if *open {
+                crate::tui::open_local_file(&path).map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        }
         MissionCommand::Add {
             mission_id,
             package_id,

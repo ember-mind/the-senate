@@ -186,6 +186,16 @@ pub enum MissionCommand {
     List,
     /// Show one mission: packages in dependency order, decisions, attention.
     Show { mission_id: MissionId },
+    /// Write a local HTML progress brief over committed mission evidence.
+    Recap {
+        mission_id: MissionId,
+        /// Include a local PNG, JPEG, GIF or WebP image (repeatable).
+        #[arg(long = "visual")]
+        visuals: Vec<PathBuf>,
+        /// Open the generated brief in the default browser.
+        #[arg(long)]
+        open: bool,
+    },
     /// Add a work package to the plan.
     Add {
         mission_id: MissionId,
