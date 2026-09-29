@@ -13,7 +13,7 @@ pub enum OpencodeProviderError {
     #[error("opencode CLI authentication probe failed: {0}")]
     AuthStatusFailed(String),
     #[error(
-        "opencode CLI is installed but has no configured credentials; authenticate with native `opencode auth login`, then retry"
+        "opencode CLI reports no available models through native credentials, environment or provider configuration; configure a native provider or authenticate with `opencode auth login`, then retry"
     )]
     NotAuthenticated,
     #[error("opencode CLI model listing failed: {0}")]
@@ -40,8 +40,8 @@ pub enum OpencodeProviderError {
     )]
     ContinueInstructionOmitted(StageId),
     #[error(
-        "opencode stage prompt exceeds the {0}-byte argv safety ceiling even after shedding \
-         navigation evidence; opencode has no verified stdin or file alternative for a stage prompt"
+        "opencode stage prompt exceeds the {0}-byte resource limit even after shedding \
+         navigation evidence"
     )]
     PromptTooLarge(usize),
     #[error("{0}")]

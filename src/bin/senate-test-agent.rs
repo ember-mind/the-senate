@@ -427,10 +427,8 @@ fn codex_fixture(arguments: &[OsString]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Fixture for `opencode run --format json ...`. Real opencode has no
-/// stdin-based prompt (see `providers::opencode::command`), so the stage
-/// prompt arrives as the last positional argv element and is parsed there,
-/// mirroring how the Codex fixture parses stdin.
+/// Fixture for the native JSONL protocol. Prompts arrive on immutable stdin;
+/// discovery fails unless it has the same protections as managed execution.
 #[allow(
     clippy::too_many_lines,
     reason = "single fixture command keeps native CLI protocol behavior inspectable"
@@ -440,35 +438,53 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         .iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    match args.as_slice() {
-        [version] if version == "--version" => {
-            writeln!(std::io::stdout(), "1.18.32")?;
+    let is_run = args.first().map(String::as_str) == Some("run");
+    check_opencode_protection(&args, is_run)?;
+    let probe_args = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--pure")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match probe_args.as_slice() {
+        ["--version"] => {
+            writeln!(std::io::stdout(), "1.18.33")?;
             return Ok(());
         }
-        [auth, list] if auth == "auth" && list == "list" => {
+        ["debug", "config"] => {
+            let config = std::env::var("SENATE_FAKE_OPENCODE_CONFIG")
+                .unwrap_or_else(|_| "{}".to_owned());
+            writeln!(std::io::stdout(), "{config}")?;
+            return Ok(());
+        }
+        ["auth", "list"] => {
+            let count = std::env::var("SENATE_FAKE_OPENCODE_CREDENTIAL_COUNT")
+                .unwrap_or_else(|_| "2".to_owned());
             if std::env::var_os("SENATE_FAKE_OPENCODE_UNAUTHENTICATED").is_some() {
                 writeln!(std::io::stdout(), "0 credentials")?;
             } else {
-                writeln!(std::io::stdout(), "2 credentials")?;
+                writeln!(std::io::stdout(), "{count} credentials")?;
             }
             return Ok(());
         }
-        [models] if models == "models" => {
-            writeln!(
-                std::io::stdout(),
-                "opencode-go/deepseek-v4-pro\nopencode-go/kimi-k3\ngoogle/gemini-2.5-pro"
-            )?;
+        ["models"] => {
+            if std::env::var_os("SENATE_FAKE_OPENCODE_UNAUTHENTICATED").is_none() {
+                writeln!(
+                    std::io::stdout(),
+                    "opencode-go/deepseek-v4-pro\nopencode-go/kimi-k3\ngoogle/gemini-2.5-pro"
+                )?;
+            }
             return Ok(());
         }
         _ => {}
     }
-    if args.first().map(String::as_str) != Some("run") {
+    if !is_run {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "fixture expected opencode run",
         ));
     }
-    let prompt = args.last().cloned().unwrap_or_default();
+    let mut prompt = String::new();
+    std::io::stdin().read_to_string(&mut prompt)?;
     let stage = prompt
         .lines()
         .find_map(|line| line.strip_prefix("Stage: "))
@@ -483,6 +499,7 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         let capture = std::path::PathBuf::from(capture);
         std::fs::create_dir_all(&capture)?;
         std::fs::write(capture.join(format!("{stage}.argv")), args.join("\n"))?;
+        std::fs::write(capture.join(format!("{stage}.stdin")), &prompt)?;
     }
     if std::env::var_os("SENATE_FAKE_OPENCODE_WRITE").is_some() {
         std::fs::write("hello.txt", "created by fake opencode\n")?;
@@ -504,12 +521,7 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
         return Ok(());
     }
 
-    // Shape copied from a real end-to-end run: opencode auto-rejects a `bash`
-    // call it cannot interactively ask about and ends the whole invocation
-    // right there — a clean `exit 0` whose last record is `step_finish`
-    // reason `"tool-calls"`, never `"stop"`. Only the first invocation halts;
-    // a `-s`/`--session` resume (an approval or a decline) completes
-    // normally, since the fixture has nothing further to react to.
+    // A headless ask rejection ends the invocation with no terminal stop.
     if std::env::var_os("SENATE_FAKE_OPENCODE_PERMISSION_HALT").is_some() && !is_resume {
         let message_id = format!("msg_{stage}");
         writeln!(
@@ -586,6 +598,37 @@ fn opencode_fixture(arguments: &[OsString]) -> std::io::Result<()> {
             }
         })
     )?;
+    Ok(())
+}
+
+fn check_opencode_protection(args: &[String], is_run: bool) -> std::io::Result<()> {
+    let config = std::env::var_os("OPENCODE_CONFIG");
+    let protected = args.iter().any(|arg| arg == "--pure")
+        && std::env::var("OPENCODE_DISABLE_PROJECT_CONFIG").as_deref() == Ok("1")
+        && config.is_some_and(|path| std::path::Path::new(&path).is_file())
+        && std::env::var("OPENCODE_CONFIG_DIR").as_deref() == Ok("")
+        && std::env::var("OPENCODE_CONFIG_CONTENT").as_deref() == Ok("");
+    if !protected {
+        return Err(std::io::Error::other("unprotected opencode invocation"));
+    }
+    if !is_run {
+        let permission: serde_json::Value = serde_json::from_str(
+            &std::env::var("OPENCODE_PERMISSION").unwrap_or_default(),
+        )?;
+        if permission["edit"] != "deny" || permission["bash"] != "deny" {
+            return Err(std::io::Error::other("unprotected discovery permissions"));
+        }
+        if let Some(source) = std::env::var_os("SENATE_FAKE_OPENCODE_SOURCE")
+            && std::env::current_dir()? == std::path::PathBuf::from(source)
+        {
+            return Err(std::io::Error::other("probe ran in the source checkout"));
+        }
+        let mut stdin = Vec::new();
+        std::io::stdin().read_to_end(&mut stdin)?;
+        if !stdin.is_empty() {
+            return Err(std::io::Error::other("probe consumed operator input"));
+        }
+    }
     Ok(())
 }
 

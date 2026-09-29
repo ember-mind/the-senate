@@ -1,10 +1,6 @@
-//! Native opencode CLI adapter. Drives the user's own local `opencode`
-//! installation and its native per-vendor authentication
-//! (`~/.local/share/opencode/auth.json`); no vendor API key is ever read,
-//! copied, or passed through this adapter. Any `opencode models` entry can
-//! serve a stage — `opencode-go/deepseek-v4-pro`, `google/gemini-...`,
-//! `opencode-go/kimi-k3`, and so on — because the model id itself carries the
-//! vendor; The Senate never special-cases one.
+//! Native opencode CLI adapter. Drives the user's own local installation
+//! and native per-vendor authentication, never a vendor SDK. Prompts use
+//! immutable stdin; discovery and every launch audit native permissions.
 
 mod artifact;
 mod command;
@@ -26,12 +22,11 @@ use crate::domain::{
     StageKind, StageStatus,
 };
 use crate::engine::{
-    Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest,
-    ProviderSignal,
+    Provider, ProviderAttentionContext, ProviderError, ProviderPoll, ProviderRequest, ProviderSignal,
 };
 use crate::process::{
-    ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend,
-    ProcessManager, TmuxBackend,
+    ManagedProcessId, ManagedProcessStatus, OutputChunk, OutputStream, ProcessBackend, ProcessManager,
+    TmuxBackend,
 };
 use crate::providers::{
     PendingProviderAttention, ProviderCommit, ProviderSessionMutation, ProviderSessionRecord,
@@ -45,19 +40,9 @@ use protocol::{OpencodeEvent, OpencodeKind, first_record};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-/// Ceiling for one record. A single line larger than this fails the poll
-/// rather than growing the read without bound.
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
-/// Ceiling for one line held in memory while reconstructing the final
-/// answer. Generous against JSON escaping.
 const MAX_MESSAGE_LINE_BYTES: u64 = 8 * 1024 * 1024;
-/// Ceiling on the retained stdout scanned for a denied `bash` call when a
-/// clean exit never reached a terminal `stop` step. Mirrors Claude's own
-/// denial-recovery scan: an oversized log yields no evidence rather than
-/// being pulled fully into memory, which asks the operator instead of
-/// guessing.
 const MAX_DENIAL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
-/// Ceiling on one persisted operator response to a permission attention.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct OpencodeProvider<B = TmuxBackend> {
@@ -70,12 +55,10 @@ pub struct OpencodeProvider<B = TmuxBackend> {
 }
 
 impl OpencodeProvider<TmuxBackend> {
-    /// Builds native adapter using discovered opencode CLI, tmux, and The
-    /// Senate data root.
+    /// Builds the native adapter using opencode, tmux and The Senate data root.
     ///
     /// # Errors
-    /// Returns missing/auth/unknown-model/process-path failures before
-    /// execution starts.
+    /// Returns discovery, permission, model or process-path failures.
     pub fn from_environment(model: Option<ModelId>) -> Result<Self, OpencodeProviderError> {
         let installation = OpencodeInstallation::discover()?;
         installation.require_authenticated()?;
@@ -117,9 +100,7 @@ impl OpencodeProvider<TmuxBackend> {
 }
 
 impl<B> OpencodeProvider<B> {
-    /// Sets the requested effort translated onto the native `--variant`
-    /// flag. `NativeDefault` keeps invocations byte-identical to pre-effort
-    /// policy.
+    /// Sets requested native effort; native default omits the variant flag.
     #[must_use]
     pub fn with_effort(mut self, effort: EffortSetting) -> Self {
         self.effort = effort;
@@ -137,9 +118,6 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         std::time::SystemTime::now().into()
     }
 
-    /// A follow-up stage's operator instruction, persisted by
-    /// [`crate::app::RunService::request_continue`] before this stage's
-    /// initial invocation ever runs. `None` for every other stage kind.
     fn continue_instruction(
         &self,
         request: &ProviderRequest,
@@ -154,12 +132,6 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         )?)
     }
 
-    /// The repository's standing bash allowlist translated onto opencode's
-    /// bash-permission patterns, read from the run's own worktree and then
-    /// from the repository it was cut from. A workspace not ready yet grants
-    /// nothing rather than failing: `prepare_with_input` is the check that a
-    /// stage cannot run without a worktree, and it runs a few lines later
-    /// with a better error than this one would give.
     fn bash_allow(
         store: &SqliteStore,
         request: &ProviderRequest,
@@ -188,12 +160,6 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             .join(format!("invocation-{invocation}.config.json"))
     }
 
-    /// Writes this invocation's permission config, the shape stage kind alone
-    /// decides (see [`command::OpencodeSandbox`]), to a run-private path this
-    /// invocation's `OPENCODE_CONFIG` points at for the record. `OPENCODE_CONFIG`
-    /// is not the enforcement authority — a repository-controlled
-    /// `opencode.json` can override it — so the same `config["permission"]`
-    /// value is also carried as `OPENCODE_PERMISSION`, built by the caller.
     fn write_config(path: &Path, config: &Value) -> Result<(), OpencodeProviderError> {
         create_private_parent(path)?;
         std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
@@ -205,10 +171,6 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         Ok(())
     }
 
-    /// The exact denied `bash` command a pending permission attention points
-    /// at, re-read from the retained stdout range [`PendingProviderAttention`]
-    /// bounds — the same seek-and-parse-one-record pattern Claude's own
-    /// denial recovery uses.
     fn read_pending_denial(
         store: &SqliteStore,
         pending: &PendingProviderAttention,
@@ -259,9 +221,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         }
     }
 
-    /// Persists the operator's decline instruction once. Absence of this file
-    /// at resume time is itself meaningful: it is how the adapter tells an
-    /// approval (no response ever staged) from a decline (one was).
+    /// Absence means approval; an immutable response carries a decline.
     fn write_response_once(
         &self,
         session_id: ProviderSessionRecordId,
@@ -316,6 +276,9 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         request: &ProviderRequest,
         mut session: ProviderSessionRecord,
     ) -> Result<ProviderPoll, OpencodeProviderError> {
+        // Native configuration can change while a run waits for attention.
+        // Audit again before both fresh launches and orphan recovery.
+        self.installation.validate_permissions()?;
         let invocation = session
             .invocation()
             .checked_add(1)
@@ -347,13 +310,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
 
         let config_path = self.config_path(request, &session, invocation);
         let mut bash_allow = Self::bash_allow(store, request)?;
-        // A pending permission attention resolves into this invocation's own
-        // command and config: an approval widens the allowlist by exactly the
-        // denied command's own top-level parts (opencode's own permission
-        // granularity — a compound command is checked part by part) and asks
-        // the agent to retry it; a decline grants nothing and carries the
-        // operator's instruction instead. Read before `bind_process` below,
-        // which clears it.
+        // Read the operator's decision before bind_process clears attention.
         let attention_note = if let Some(pending) = session.pending_attention() {
             let command = Self::read_pending_denial(store, pending)?;
             match self.read_response(session.id(), pending.attention_id())? {
@@ -424,7 +381,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             self.installation.executable(),
             command.argv,
             command.environment,
-            &[],
+            &command.stdin,
         )?;
         let expected = session.revision();
         session
@@ -446,11 +403,6 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             if session.status() == ProviderSessionStatus::Created {
                 return self.start_invocation(store, request, session);
             }
-            // A permission halt (`NeedsUser`) and an interruption both resume
-            // by launching a fresh invocation once the stage is running
-            // again; a stage that never started keeps `Ready` while the
-            // session sits interrupted over a dead process, and that needs
-            // the same fresh launch.
             if matches!(
                 session.status(),
                 ProviderSessionStatus::NeedsUser | ProviderSessionStatus::Interrupted
@@ -478,6 +430,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
             ManagedProcessStatus::Preparing | ManagedProcessStatus::Starting
         ) && !request.observe_only()
         {
+            self.installation.validate_permissions()?;
             self.manager.start(store, process_id)?;
         }
         let inspection = self.manager.inspect(store, process_id)?;
@@ -523,11 +476,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         )
     }
 
-    /// Reads unacknowledged stdout, widening the window whenever it fills
-    /// without containing a newline. Same reasoning as the Codex adapter's
-    /// equivalent: a record only completes at a newline, so a saturated
-    /// window without one can never yield a record no matter how often the
-    /// same-sized read is retried.
+    /// Widen saturated reads until a whole JSONL record can be decoded.
     fn read_record_chunk(
         &self,
         store: &SqliteStore,
@@ -570,10 +519,7 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         let mut signals = Vec::new();
         let mut session_changed = false;
 
-        // opencode carries the session id on every event, unlike Codex's
-        // dedicated `thread.started`; whichever record happens to be first
-        // for this invocation binds (or re-confirms, on resume) native
-        // session identity uniformly, regardless of its own kind.
+        // Every event carries identity; the first record binds this invocation.
         if session.status() == ProviderSessionStatus::Starting {
             let native = ProviderSessionId::new(event.session_id.clone())
                 .map_err(|error| OpencodeProviderError::Protocol(error.to_string()))?;
@@ -614,21 +560,11 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
                 if !stop {
                     signals.push(ProviderSignal::Usage(usage));
                 } else if process_status.is_active() {
-                    // Nothing below has been persisted yet, so returning here
-                    // discards nothing durable; the next poll re-derives the
-                    // identical decision once the process has actually ended.
+                    // Nothing has been committed; re-derive after process exit.
                     return Ok(ProviderPoll::Pending);
                 } else {
-                    // opencode writes no separate corroborating file the way
-                    // Codex's `--output-last-message` does, so — unlike
-                    // Codex, which can trust an unclean exit when a second
-                    // independent write agrees with the retained stream —
-                    // opencode trusts a terminal `stop` step only on a clean
-                    // exit. Anything else is reported as the same recoverable
-                    // interruption Codex falls back to for an uncorroborated
-                    // dead-process completion: the finished work stays
-                    // reachable through `senate resume`, not stranded behind
-                    // a hard failure that `retry` would throw away.
+                    // No independently written final-message file exists for
+                    // corroboration. Only a clean exit can prove completion.
                     let trusted =
                         matches!(process_status, ManagedProcessStatus::Exited) && successful_exit;
                     if trusted {
@@ -718,17 +654,8 @@ impl<B: ProcessBackend> OpencodeProvider<B> {
         }
         let expected = session.revision();
         let end = chunk.end_offset();
-        // opencode ends the whole invocation — a clean `exit 0` — the moment a
-        // headless `ask` permission is auto-rejected, never reaching a
-        // terminal `stop` step (observed by hand, both in the spike fixtures
-        // and in a real end-to-end run: `impl.jsonl`/`impl.stderr.txt` and a
-        // process whose retained stream ends on `step_finish` reason
-        // `tool-calls`). That is a permission halt, not a crash: recover the
-        // exact denied command from the retained stream and raise typed
-        // attention, the same continuation shape Claude's own permission
-        // denials use. A clean exit with no `stop` step and no denial
-        // evidence at all is a distinct, unexplained ending and gets its own
-        // specific failure rather than the generic one below.
+        // Headless ask rejection ends the invocation with exit 0 and no stop.
+        // Recover the exact denied command from retained evidence, not stderr.
         if status == ManagedProcessStatus::Exited && successful_exit {
             if let Some(process_id) = session.current_process_id() {
                 let process = store.load_managed_process(process_id)?;
@@ -805,15 +732,7 @@ impl<B: ProcessBackend> Provider for OpencodeProvider<B> {
         Ok(true)
     }
 
-    /// Stages the operator's decision on one permission halt before the
-    /// domain commits the resolution: `response: None` is "omit to approve"
-    /// (see `senate resolve`), anything else is a decline carrying that text
-    /// as the continuation instruction. Approval is validated as an exact,
-    /// non-widening grant *before* anything commits — the same
-    /// prove-it-first discipline Claude's own permission continuation uses —
-    /// so an ungrantable command (glob syntax in the denied line itself) is
-    /// refused to the operator instead of committing a resolution every
-    /// later drive would fail to build a command for.
+    /// Validate an exact approval before the domain commits the resolution.
     fn stage_attention_response(
         &mut self,
         store: &mut SqliteStore,
@@ -919,13 +838,7 @@ impl<B: ProcessBackend> Provider for OpencodeProvider<B> {
     }
 }
 
-/// The verbatim text of every `text` part under `message_id` retained in
-/// `path` before `end`, concatenated in stream order — the protocol's own
-/// definition of the final answer: "the last text part(s) of the last step
-/// with reason `stop`". `end` is where the deciding `step_finish` record
-/// ends, so this only ever sees parts that preceded it. `None` when nothing
-/// matched, which the caller treats as absence of evidence rather than an
-/// empty answer.
+/// Concatenate the winning message's retained text parts in stream order.
 fn final_answer(path: &Path, message_id: &str, end: u64) -> Option<String> {
     let mut reader = BufReader::new(File::open(path).ok()?);
     let mut line = Vec::new();
@@ -948,8 +861,7 @@ fn final_answer(path: &Path, message_id: &str, end: u64) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Reads up to [`MAX_MESSAGE_LINE_BYTES`] of one line, discarding the rest of
-/// a longer one, and returns how many bytes of the stream it covered.
+/// Retain only a bounded line, while counting all discarded bytes as well.
 fn read_capped_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<u64> {
     let mut read = u64::try_from(
         reader
@@ -975,16 +887,7 @@ fn read_capped_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::R
     Ok(read)
 }
 
-/// The last denied `bash` call retained in `path`, with its own exact byte
-/// range, or `None` when no denial is evidenced there.
-///
-/// Read-only and bounded: an oversized log yields no evidence rather than
-/// being pulled fully into memory, the same "unreadable/oversized log asks
-/// the operator" rule Claude's own denial-recovery scan already uses. The
-/// range is the *last* denial specifically, mirroring what actually happens:
-/// once opencode auto-rejects one `ask` request it stops the whole
-/// invocation, so at most one such record exists per invocation in practice,
-/// and taking the last one is simply the most defensive reading of that.
+/// Recover the last denied bash command and its exact retained byte range.
 fn last_denied_bash(path: &Path) -> Option<(String, u64, u64)> {
     let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() > MAX_DENIAL_SCAN_BYTES {
@@ -1025,875 +928,4 @@ fn create_private_parent(path: &Path) -> Result<(), OpencodeProviderError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-    use std::io::Seek as _;
-    use std::process::Command;
-    use std::sync::{Arc, Mutex};
-
-    use serde_json::json;
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::domain::{
-        ConfigSnapshotId, DomainEventKind, EventId, EventMetadata, Run, RunStatus, StageDefinition,
-        StageId, WorkflowDefinition, WorkflowKind,
-    };
-    use crate::engine::{EngineStatus, WorkflowEngine};
-    use crate::process::{
-        BackendAvailability, BackendSessionId, BackendSessionState, ExitEvidence, ExitResult,
-        ManagedProcess, ProcessError, TerminationSignal,
-    };
-    use crate::store::{ResolvedConfigSnapshot, RunInput};
-    use crate::workspace::WorkspaceManager;
-
-    fn implementation_only() -> WorkflowDefinition {
-        WorkflowDefinition::new(
-            WorkflowKind::Fast,
-            vec![StageDefinition::new(
-                StageId::new("implementation").unwrap(),
-                StageKind::Implementation,
-                Role::Implementer,
-                vec![],
-            )],
-        )
-        .unwrap()
-    }
-
-    /// Shape copied from the real `ro.jsonl` fixture (a single-turn
-    /// read-only run): `step_start`, a completed `read` tool, a `text` part
-    /// under the winning `step_finish`'s messageID, then `step_finish` with
-    /// `reason: "stop"`.
-    const SUCCESS_OUTPUT: &str = concat!(
-        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\"}}\n",
-        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"read\",\"state\":{\"status\":\"completed\"}}}\n",
-        "{\"type\":\"text\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"text\":\"# opencode result\\nFixture\"}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"stop\",\"tokens\":{\"total\":167,\"input\":100,\"output\":47,\"reasoning\":0,\"cache\":{\"write\":0,\"read\":20}}}}\n"
-    );
-
-    /// Shape copied from a real end-to-end run (`stdout.log`/`stderr.log`,
-    /// path-sanitized): opencode auto-rejects a `bash` call the headless
-    /// session cannot interactively ask about and ends the *whole
-    /// invocation* right there — a clean `exit 0` whose last record is
-    /// `step_finish` reason `"tool-calls"`, never `"stop"`. The spike's own
-    /// `impl.jsonl`/`impl.stderr.txt` and `resume.jsonl` show the same shape:
-    /// the denial ends one invocation, and a later `-s <session>` resume is
-    /// what continues it to `"stop"`.
-    const PERMISSION_HALT_OUTPUT: &str = concat!(
-        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\"}}\n",
-        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_1\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"python3 -c \\\"from calc import add; assert add(2,3)==5\\\"\"},\"error\":\"The user rejected permission to use this specific tool call.\"}}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"tool-calls\",\"tokens\":{\"total\":50,\"input\":40,\"output\":10}}}\n"
-    );
-
-    /// What a `-s ses_A` resume looks like once the operator approves the
-    /// denied command: the agent retries it and this time reaches `"stop"`.
-    const RESUME_AFTER_APPROVAL_OUTPUT: &str = concat!(
-        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\"}}\n",
-        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_2\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"python3 -c \\\"from calc import add; assert add(2,3)==5\\\"\"},\"output\":\"\"}}}\n",
-        "{\"type\":\"text\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"text\":\"# opencode result\\nVerified.\"}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"reason\":\"stop\",\"tokens\":{\"total\":30,\"input\":20,\"output\":10}}}\n"
-    );
-
-    /// Shape copied from a real end-to-end run: opencode splits a compound
-    /// command into top-level parts and checks each one, so a denial names
-    /// every part (`bash (pwd, ls -la); auto-rejecting`, real stderr) even
-    /// though only `pwd` was actually ungranted.
-    const COMPOUND_PERMISSION_HALT_OUTPUT: &str = concat!(
-        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\"}}\n",
-        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_1\",\"state\":{\"status\":\"error\",\"input\":{\"command\":\"pwd && ls -la\"},\"error\":\"The user rejected permission to use this specific tool call.\"}}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_1\",\"reason\":\"tool-calls\",\"tokens\":{\"total\":50,\"input\":40,\"output\":10}}}\n"
-    );
-
-    const COMPOUND_RESUME_AFTER_APPROVAL_OUTPUT: &str = concat!(
-        "{\"type\":\"step_start\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\"}}\n",
-        "{\"type\":\"tool_use\",\"sessionID\":\"ses_A\",\"part\":{\"tool\":\"bash\",\"callID\":\"call_2\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"pwd && ls -la\"},\"output\":\"\"}}}\n",
-        "{\"type\":\"text\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"text\":\"# opencode result\\nDone.\"}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"ses_A\",\"part\":{\"messageID\":\"msg_2\",\"reason\":\"stop\",\"tokens\":{\"total\":30,\"input\":20,\"output\":10}}}\n"
-    );
-
-    /// Shape copied from the real `err-402.jsonl` fixture.
-    const INSUFFICIENT_BALANCE_OUTPUT: &str = "{\"type\":\"error\",\"sessionID\":\"ses_A\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"Insufficient Balance\",\"statusCode\":402}}}\n";
-
-    #[derive(Clone)]
-    struct FixtureBackend {
-        started: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
-        completed: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
-        output: Arc<String>,
-        exit: Option<ExitResult>,
-    }
-
-    impl FixtureBackend {
-        fn new(output: &str) -> Self {
-            Self {
-                started: Arc::new(Mutex::new(HashSet::new())),
-                completed: Arc::new(Mutex::new(HashSet::new())),
-                output: Arc::new(output.to_owned()),
-                exit: Some(ExitResult::ExitCode { code: 0 }),
-            }
-        }
-
-        fn with_exit(mut self, exit: Option<ExitResult>) -> Self {
-            self.exit = exit;
-            self
-        }
-    }
-
-    impl ProcessBackend for FixtureBackend {
-        fn kind(&self) -> &'static str {
-            "fixture"
-        }
-
-        fn session_id(&self, process_id: crate::process::ManagedProcessId) -> BackendSessionId {
-            BackendSessionId::for_process(process_id)
-        }
-
-        fn availability(&self) -> Result<BackendAvailability, ProcessError> {
-            Ok(BackendAvailability {
-                kind: self.kind(),
-                version: "fixture-1".to_owned(),
-            })
-        }
-
-        fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
-            std::fs::write(process.spec().stdout_path(), self.output.as_bytes())?;
-            self.started.lock().unwrap().insert(process.id());
-            Ok(())
-        }
-
-        fn inspect_session(
-            &self,
-            process: &ManagedProcess,
-        ) -> Result<BackendSessionState, ProcessError> {
-            if self.started.lock().unwrap().contains(&process.id()) {
-                self.completed.lock().unwrap().insert(process.id());
-            }
-            Ok(BackendSessionState::Absent)
-        }
-
-        fn read_output(
-            &self,
-            process: &ManagedProcess,
-            stream: OutputStream,
-            offset: u64,
-            max_bytes: usize,
-        ) -> Result<OutputChunk, ProcessError> {
-            let path = match stream {
-                OutputStream::Stdout => process.spec().stdout_path(),
-                OutputStream::Stderr => process.spec().stderr_path(),
-            };
-            let mut file = File::open(path)?;
-            file.seek(std::io::SeekFrom::Start(offset))?;
-            let mut bytes = Vec::new();
-            file.take(u64::try_from(max_bytes).unwrap())
-                .read_to_end(&mut bytes)?;
-            OutputChunk::new(
-                process.id(),
-                stream,
-                process.cursor(stream).revision(),
-                offset,
-                bytes,
-            )
-        }
-
-        fn output_length(
-            &self,
-            process: &ManagedProcess,
-            stream: OutputStream,
-        ) -> Result<u64, ProcessError> {
-            let path = match stream {
-                OutputStream::Stdout => process.spec().stdout_path(),
-                OutputStream::Stderr => process.spec().stderr_path(),
-            };
-            Ok(std::fs::metadata(path)?.len())
-        }
-
-        fn read_exit_evidence(
-            &self,
-            process: &ManagedProcess,
-        ) -> Result<Option<ExitEvidence>, ProcessError> {
-            let Some(result) = self.exit.clone() else {
-                return Ok(None);
-            };
-            if !self.completed.lock().unwrap().contains(&process.id()) {
-                return Ok(None);
-            }
-            let now = OpencodeProvider::<Self>::now();
-            Ok(Some(ExitEvidence::new(
-                process.id(),
-                process.command_fingerprint().to_owned(),
-                result,
-                false,
-                now,
-                now,
-            )))
-        }
-
-        fn signal(
-            &self,
-            _process: &ManagedProcess,
-            _signal: TerminationSignal,
-        ) -> Result<(), ProcessError> {
-            Ok(())
-        }
-
-        fn cleanup(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
-            Ok(())
-        }
-    }
-
-    /// One recorded invocation's number and exact argv.
-    type RecordedInvocation = (u32, Vec<String>);
-
-    /// Invocation 1 replays a real permission halt; invocation 2+ replays
-    /// what a `-s ses_A` resume looks like once approved. Records every
-    /// invocation's exact argv, so a test can check the resume actually
-    /// carries `--session ses_A`.
-    #[derive(Clone)]
-    struct HaltThenResumeBackend {
-        halt_output: &'static str,
-        resume_output: &'static str,
-        started: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
-        completed: Arc<Mutex<HashSet<crate::process::ManagedProcessId>>>,
-        invocations: Arc<Mutex<Vec<RecordedInvocation>>>,
-    }
-
-    impl Default for HaltThenResumeBackend {
-        fn default() -> Self {
-            Self::new(PERMISSION_HALT_OUTPUT, RESUME_AFTER_APPROVAL_OUTPUT)
-        }
-    }
-
-    impl HaltThenResumeBackend {
-        fn new(halt_output: &'static str, resume_output: &'static str) -> Self {
-            Self {
-                halt_output,
-                resume_output,
-                started: Arc::new(Mutex::new(HashSet::new())),
-                completed: Arc::new(Mutex::new(HashSet::new())),
-                invocations: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    impl ProcessBackend for HaltThenResumeBackend {
-        fn kind(&self) -> &'static str {
-            "halt_then_resume"
-        }
-
-        fn session_id(&self, process_id: crate::process::ManagedProcessId) -> BackendSessionId {
-            BackendSessionId::for_process(process_id)
-        }
-
-        fn availability(&self) -> Result<BackendAvailability, ProcessError> {
-            Ok(BackendAvailability {
-                kind: self.kind(),
-                version: "fixture-1".to_owned(),
-            })
-        }
-
-        fn start(&self, process: &ManagedProcess, _manifest: &Path) -> Result<(), ProcessError> {
-            let argv = process
-                .spec()
-                .argv()
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            self.invocations
-                .lock()
-                .unwrap()
-                .push((process.invocation(), argv));
-            let output = if process.invocation() == 1 {
-                self.halt_output
-            } else {
-                self.resume_output
-            };
-            std::fs::write(process.spec().stdout_path(), output)?;
-            self.started.lock().unwrap().insert(process.id());
-            Ok(())
-        }
-
-        fn inspect_session(
-            &self,
-            process: &ManagedProcess,
-        ) -> Result<BackendSessionState, ProcessError> {
-            if self.started.lock().unwrap().contains(&process.id()) {
-                self.completed.lock().unwrap().insert(process.id());
-            }
-            Ok(BackendSessionState::Absent)
-        }
-
-        fn read_output(
-            &self,
-            process: &ManagedProcess,
-            stream: OutputStream,
-            offset: u64,
-            max_bytes: usize,
-        ) -> Result<OutputChunk, ProcessError> {
-            let path = match stream {
-                OutputStream::Stdout => process.spec().stdout_path(),
-                OutputStream::Stderr => process.spec().stderr_path(),
-            };
-            let mut file = File::open(path)?;
-            file.seek(std::io::SeekFrom::Start(offset))?;
-            let mut bytes = Vec::new();
-            file.take(u64::try_from(max_bytes).unwrap())
-                .read_to_end(&mut bytes)?;
-            OutputChunk::new(
-                process.id(),
-                stream,
-                process.cursor(stream).revision(),
-                offset,
-                bytes,
-            )
-        }
-
-        fn output_length(
-            &self,
-            process: &ManagedProcess,
-            stream: OutputStream,
-        ) -> Result<u64, ProcessError> {
-            let path = match stream {
-                OutputStream::Stdout => process.spec().stdout_path(),
-                OutputStream::Stderr => process.spec().stderr_path(),
-            };
-            Ok(std::fs::metadata(path)?.len())
-        }
-
-        fn read_exit_evidence(
-            &self,
-            process: &ManagedProcess,
-        ) -> Result<Option<ExitEvidence>, ProcessError> {
-            if !self.completed.lock().unwrap().contains(&process.id()) {
-                return Ok(None);
-            }
-            let now = OpencodeProvider::<Self>::now();
-            Ok(Some(ExitEvidence::new(
-                process.id(),
-                process.command_fingerprint().to_owned(),
-                ExitResult::ExitCode { code: 0 },
-                false,
-                now,
-                now,
-            )))
-        }
-
-        fn signal(
-            &self,
-            _process: &ManagedProcess,
-            _signal: TerminationSignal,
-        ) -> Result<(), ProcessError> {
-            Ok(())
-        }
-
-        fn cleanup(&self, _process: &ManagedProcess) -> Result<(), ProcessError> {
-            Ok(())
-        }
-    }
-
-    fn fixture(
-        output: &str,
-    ) -> (
-        TempDir,
-        PathBuf,
-        crate::domain::RunId,
-        SqliteStore,
-        OpencodeProvider<FixtureBackend>,
-    ) {
-        fixture_with(FixtureBackend::new(output))
-    }
-
-    fn fixture_with<B: ProcessBackend>(
-        backend: B,
-    ) -> (
-        TempDir,
-        PathBuf,
-        crate::domain::RunId,
-        SqliteStore,
-        OpencodeProvider<B>,
-    ) {
-        let temp = TempDir::new().unwrap();
-        let source = temp.path().join("source");
-        init_repository(&source);
-        let database = temp.path().join("senate.db");
-        let process_root = temp.path().join("runs");
-        let run_id = crate::domain::RunId::new();
-        let created_at = OpencodeProvider::<B>::now();
-        let config_id = ConfigSnapshotId::new(format!("opencode-{run_id}")).unwrap();
-        let run = Run::new(run_id, implementation_only(), config_id.clone(), created_at);
-        let input = RunInput::new(run_id, "fixture task", created_at).unwrap();
-        let config = opencode_config(config_id, created_at);
-        let created = run.created_event(EventMetadata::new(EventId::new(), created_at));
-        let mut store = SqliteStore::open(&database).unwrap();
-        store
-            .create_run_with_input(&run, &input, &config, &[created])
-            .unwrap();
-        WorkspaceManager::new(temp.path().join("worktrees"))
-            .prepare_run_workspace(&mut store, run_id, &source)
-            .unwrap();
-        let provider = OpencodeProvider {
-            id: ProviderId::new("opencode").unwrap(),
-            installation: OpencodeInstallation::fixture(PathBuf::from("/bin/true")),
-            model: None,
-            effort: EffortSetting::NativeDefault,
-            manager: ProcessManager::new(&process_root, backend),
-            artifact_root: process_root,
-        };
-        (temp, database, run_id, store, provider)
-    }
-
-    fn opencode_config(
-        config_id: ConfigSnapshotId,
-        created_at: DateTime<Utc>,
-    ) -> ResolvedConfigSnapshot {
-        ResolvedConfigSnapshot::new(
-            config_id,
-            1,
-            json!({
-                "schema_version":1,
-                "profile":"native_opencode",
-                "provider":"opencode",
-                "model":null,
-                "provider_options":{
-                    "execution_protocol":"run_json_v1",
-                    "permission_policy":"stage_kind_v1"
-                }
-            }),
-            created_at,
-        )
-        .unwrap()
-    }
-
-    fn init_repository(path: &Path) {
-        std::fs::create_dir_all(path).unwrap();
-        command(path, &["init"]);
-        command(path, &["config", "user.email", "senate@example.invalid"]);
-        command(path, &["config", "user.name", "The Senate Test"]);
-        std::fs::write(path.join("README.md"), "fixture\n").unwrap();
-        command(path, &["add", "README.md"]);
-        command(path, &["commit", "-m", "fixture"]);
-    }
-
-    fn command(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn drive_to_completion<B: ProcessBackend>(
-        engine: &mut WorkflowEngine<OpencodeProvider<B>>,
-        store: &mut SqliteStore,
-        run_id: crate::domain::RunId,
-    ) -> RunStatus {
-        loop {
-            match engine.drive(store, run_id).unwrap() {
-                EngineStatus::Finished { run_status } => return run_status,
-                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
-                status => panic!("unexpected status: {status:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn successful_turn_persists_artifact_usage_and_completes() {
-        let (_temp, database, run_id, mut store, provider) = fixture(SUCCESS_OUTPUT);
-        let mut engine = WorkflowEngine::new(provider, "SUPER_SECRET_TASK_MARKER");
-        assert_eq!(
-            drive_to_completion(&mut engine, &mut store, run_id),
-            RunStatus::Completed
-        );
-
-        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-        assert_eq!(session.status(), ProviderSessionStatus::Completed);
-        assert_eq!(session.native_session_id().unwrap().as_str(), "ses_A");
-
-        let process = store
-            .load_managed_process(session.current_process_id().unwrap())
-            .unwrap();
-        let argv = process
-            .spec()
-            .argv()
-            .iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>();
-        assert!(
-            argv.iter()
-                .any(|arg| arg.contains("SUPER_SECRET_TASK_MARKER")),
-            "the prompt travels as argv, the only transport opencode's CLI offers"
-        );
-        assert!(
-            process
-                .spec()
-                .environment()
-                .contains_key(&std::ffi::OsString::from("OPENCODE_CONFIG"))
-        );
-        // A repository-controlled opencode.json overriding OPENCODE_CONFIG is
-        // a verified real vulnerability; every real managed process spec must
-        // carry both independently-verified defenses, and --pure, end to end.
-        assert_eq!(
-            process
-                .spec()
-                .environment()
-                .get(&std::ffi::OsString::from("OPENCODE_DISABLE_PROJECT_CONFIG")),
-            Some(&std::ffi::OsString::from("1"))
-        );
-        assert!(
-            process
-                .spec()
-                .environment()
-                .contains_key(&std::ffi::OsString::from("OPENCODE_PERMISSION")),
-        );
-        assert!(argv.iter().any(|arg| arg == "--pure"), "{argv:?}");
-
-        let events = store.load_events(run_id).unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event.event.kind(),
-                    DomainEventKind::ProviderUsageUpdated {
-                        input_units: 100,
-                        output_units: 47,
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event.event.kind(),
-                    DomainEventKind::ProviderCompleted { .. }
-                ))
-                .count(),
-            1
-        );
-
-        let artifacts = store.list_artifacts(run_id).unwrap();
-        assert_eq!(artifacts.len(), 1);
-        assert_eq!(
-            artifacts[0].metadata().provider_id().unwrap().as_str(),
-            "opencode"
-        );
-        let content = std::fs::read_to_string(artifacts[0].path()).unwrap();
-        assert!(content.contains("# opencode result"));
-
-        drop(store);
-        let mut store = SqliteStore::open(database).unwrap();
-        assert_eq!(
-            store.load_run(run_id).unwrap().run.status(),
-            RunStatus::Completed
-        );
-    }
-
-    /// Headless opencode auto-rejects a permission it cannot ask about and
-    /// ends the whole invocation right there (verified against a real
-    /// end-to-end run) — a permission halt, not silent progress. It raises
-    /// the same typed continuable attention Claude's own permission denials
-    /// do; approving it resumes the same native session with the exact
-    /// command now allowed, and the run completes.
-    #[test]
-    fn a_permission_halt_raises_attention_and_approval_resumes_and_completes() {
-        let backend = HaltThenResumeBackend::default();
-        let inspector = backend.clone();
-        let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
-        let mut engine = WorkflowEngine::new(provider, "fix the bug");
-        let request_id = loop {
-            match engine.drive(&mut store, run_id).unwrap() {
-                EngineStatus::NeedsUser { requests } => break requests[0],
-                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
-                status => panic!("unexpected status: {status:?}"),
-            }
-        };
-
-        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-        assert_eq!(session.status(), ProviderSessionStatus::NeedsUser);
-        assert_eq!(session.native_session_id().unwrap().as_str(), "ses_A");
-
-        let loaded = store.load_run(run_id).unwrap();
-        let attention = loaded
-            .run
-            .attention_requests()
-            .iter()
-            .find(|request| request.id() == request_id)
-            .unwrap();
-        assert_eq!(attention.kind(), crate::domain::AttentionKind::Permission);
-        assert!(
-            attention.summary().contains("python3 -c"),
-            "{}",
-            attention.summary()
-        );
-
-        // Approve: omit a response, exactly like `senate resolve <run> <id>`.
-        engine
-            .resolve_attention_with_response(&mut store, run_id, request_id, None)
-            .unwrap();
-        assert_eq!(
-            drive_to_completion(&mut engine, &mut store, run_id),
-            RunStatus::Completed
-        );
-
-        let invocations = inspector.invocations.lock().unwrap().clone();
-        assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[0].0, 1);
-        assert_eq!(invocations[1].0, 2);
-        assert!(
-            invocations[1]
-                .1
-                .windows(2)
-                .any(|pair| pair[0] == "--session" && pair[1] == "ses_A"),
-            "{:?}",
-            invocations[1].1
-        );
-
-        let config_path = temp
-            .path()
-            .join("runs")
-            .join(run_id.to_string())
-            .join("provider-output")
-            .join("opencode")
-            .join(session.id().to_string())
-            .join("invocation-2.config.json");
-        let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-        assert_eq!(
-            config["permission"]["bash"]["python3 -c \"from calc import add; assert add(2,3)==5\""],
-            serde_json::json!("allow")
-        );
-    }
-
-    /// Regression for a real end-to-end failure: approving a compound denial
-    /// (`pwd && ls -la`) used to grant the whole joined string as one
-    /// pattern, which matched neither of opencode's own split parts and the
-    /// same denial repeated forever. Approval must grant every split part.
-    #[test]
-    fn approving_a_compound_denial_grants_every_split_part() {
-        let backend = HaltThenResumeBackend::new(
-            COMPOUND_PERMISSION_HALT_OUTPUT,
-            COMPOUND_RESUME_AFTER_APPROVAL_OUTPUT,
-        );
-        let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
-        let mut engine = WorkflowEngine::new(provider, "fix the bug");
-        let request_id = loop {
-            match engine.drive(&mut store, run_id).unwrap() {
-                EngineStatus::NeedsUser { requests } => break requests[0],
-                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
-                status => panic!("unexpected status: {status:?}"),
-            }
-        };
-        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-
-        engine
-            .resolve_attention_with_response(&mut store, run_id, request_id, None)
-            .unwrap();
-        assert_eq!(
-            drive_to_completion(&mut engine, &mut store, run_id),
-            RunStatus::Completed
-        );
-
-        let config_path = temp
-            .path()
-            .join("runs")
-            .join(run_id.to_string())
-            .join("provider-output")
-            .join("opencode")
-            .join(session.id().to_string())
-            .join("invocation-2.config.json");
-        let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-        assert_eq!(
-            config["permission"]["bash"]["pwd"],
-            serde_json::json!("allow")
-        );
-        assert_eq!(
-            config["permission"]["bash"]["ls -la"],
-            serde_json::json!("allow")
-        );
-    }
-
-    /// A decline carries the operator's text into the continuation instead
-    /// of granting anything, and the resumed config never allows the denied
-    /// command.
-    #[test]
-    fn a_declined_permission_halt_resumes_without_granting_anything() {
-        let backend = HaltThenResumeBackend::default();
-        let (temp, _database, run_id, mut store, provider) = fixture_with(backend);
-        let mut engine = WorkflowEngine::new(provider, "fix the bug");
-        let request_id = loop {
-            match engine.drive(&mut store, run_id).unwrap() {
-                EngineStatus::NeedsUser { requests } => break requests[0],
-                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
-                status => panic!("unexpected status: {status:?}"),
-            }
-        };
-        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-
-        engine
-            .resolve_attention_with_response(
-                &mut store,
-                run_id,
-                request_id,
-                Some("Continue without running it."),
-            )
-            .unwrap();
-        // Drive far enough to observe the resumed invocation's own config;
-        // the fixture backend always replays a successful shape for
-        // invocation 2+, which is fine here since only the config matters.
-        drive_to_completion(&mut engine, &mut store, run_id);
-
-        let config_path = temp
-            .path()
-            .join("runs")
-            .join(run_id.to_string())
-            .join("provider-output")
-            .join("opencode")
-            .join(session.id().to_string())
-            .join("invocation-2.config.json");
-        let config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
-        assert_eq!(
-            config["permission"]["bash"]
-                .get("python3 -c \"from calc import add; assert add(2,3)==5\""),
-            None,
-            "a decline must never widen the allowlist"
-        );
-    }
-
-    /// Shape copied from the real `err-402.jsonl`/`nomodel.jsonl` fixtures: a
-    /// top-level `error` record fails the stage with a scrubbed message.
-    #[test]
-    fn a_vendor_error_fails_the_stage_with_a_scrubbed_message() {
-        let (_temp, _database, run_id, mut store, provider) = fixture(INSUFFICIENT_BALANCE_OUTPUT);
-        let mut engine = WorkflowEngine::new(provider, "fixture task");
-        assert_eq!(
-            drive_to_completion(&mut engine, &mut store, run_id),
-            RunStatus::Failed
-        );
-        let events = store.load_events(run_id).unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event.event.kind(),
-            DomainEventKind::ProviderFailed { reason: Some(reason), .. }
-                if reason.contains("APIError") && reason.contains("Insufficient Balance")
-        )));
-    }
-
-    /// opencode writes no corroborating final-message file the way Codex
-    /// does, so a terminal `stop` step whose process then died any way other
-    /// than a clean exit is never trusted as completion — it is reported as
-    /// a recoverable interruption instead, exactly what `senate resume`
-    /// exists for.
-    #[test]
-    fn a_stop_step_after_an_unclean_exit_is_a_recoverable_interruption_not_a_completion() {
-        let (_temp, _database, run_id, mut store, provider) = fixture_with(
-            FixtureBackend::new(SUCCESS_OUTPUT).with_exit(Some(ExitResult::ExitCode { code: 1 })),
-        );
-        let mut engine = WorkflowEngine::new(provider, "fixture task");
-        loop {
-            match engine.drive(&mut store, run_id).unwrap() {
-                EngineStatus::Interrupted { .. } => break,
-                EngineStatus::Finished { run_status } => {
-                    panic!("unexpected terminal status: {run_status:?}")
-                }
-                EngineStatus::Advanced { .. } | EngineStatus::WaitingForProvider { .. } => {}
-                other => panic!("unexpected status: {other:?}"),
-            }
-        }
-        assert!(store.list_artifacts(run_id).unwrap().is_empty());
-        let session = store.list_provider_sessions(run_id).unwrap().pop().unwrap();
-        assert_eq!(session.status(), ProviderSessionStatus::Interrupted);
-    }
-
-    /// Session binding is generic over first-invocation vs. resumed-invocation:
-    /// whichever record arrives first for an invocation binds (or re-confirms)
-    /// native identity, and the emitted signal is `Started` only for signal
-    /// index zero — every later invocation, including a resume, reports
-    /// `Resumed` instead, exercised here directly against `map_record` rather
-    /// than through a full recovery drive, which is shared engine machinery
-    /// Codex's own suite already exercises.
-    #[test]
-    fn a_resumed_invocations_first_record_reports_resumed_not_started() {
-        let (_temp, _database, run_id, mut store, mut provider) = fixture(SUCCESS_OUTPUT);
-        let workspace = store.load_workspace(run_id).unwrap().unwrap();
-        let mut session = ProviderSessionRecord::new(
-            ProviderSessionRecordId::new(),
-            run_id,
-            StageId::new("implementation").unwrap(),
-            1,
-            ProviderId::new("opencode").unwrap(),
-            PROTOCOL_VERSION,
-            None,
-            OpencodeProvider::<FixtureBackend>::now(),
-        );
-        session
-            .activate(
-                ProviderSessionId::new("ses_A").unwrap(),
-                None,
-                OpencodeProvider::<FixtureBackend>::now(),
-            )
-            .unwrap();
-        // A resume rebinds a process, which returns the session to
-        // `Starting` until the next record confirms it again.
-        let process = provider
-            .manager
-            .prepare_with_input(
-                &mut store,
-                run_id,
-                StageId::new("implementation").unwrap(),
-                1,
-                2,
-                Path::new("/bin/true"),
-                vec![],
-                BTreeMap::new(),
-                &[],
-            )
-            .unwrap();
-        session
-            .bind_process(process.id(), 2, OpencodeProvider::<FixtureBackend>::now())
-            .unwrap();
-
-        let request = ProviderRequest::new(
-            run_id,
-            StageId::new("implementation").unwrap(),
-            StageKind::Implementation,
-            StageStatus::Running,
-            Role::Implementer,
-            "fixture task".to_owned(),
-            workspace.worktree_path().to_path_buf(),
-            1,
-            1,
-            Some(ProviderSessionId::new("ses_A").unwrap()),
-            vec![],
-        );
-        let event = OpencodeEvent {
-            session_id: "ses_A".to_owned(),
-            kind: OpencodeKind::StepStart,
-        };
-        let chunk = OutputChunk::new(process.id(), OutputStream::Stdout, 0, 0, Vec::new()).unwrap();
-        let poll = provider
-            .map_record(
-                &mut store,
-                &request,
-                session,
-                chunk,
-                0,
-                event,
-                ManagedProcessStatus::Preparing,
-                false,
-            )
-            .unwrap();
-        match poll {
-            ProviderPoll::Emission { signals, .. } => {
-                assert_eq!(signals, vec![ProviderSignal::Resumed]);
-            }
-            other => panic!("expected an Emission carrying Resumed, got {other:?}"),
-        }
-    }
-}
+mod tests;

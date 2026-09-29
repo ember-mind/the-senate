@@ -1,47 +1,17 @@
-//! Command-line and permission-config construction for `opencode run`.
+//! Command-line, immutable stdin and permission configuration for opencode.
 //!
-//! `opencode run --help` (v1.18.32–1.18.33, verified by hand) offers no way to feed
-//! the stage prompt through stdin or a file: the message is positional argv
-//! text, and `-f`/`--file` attaches a file to the message rather than
-//! replacing it. Every other adapter in this codebase puts its prompt on
-//! immutable stdin; here that is not available, so the prompt travels as a
-//! plain positional argument instead — still one `std::process::Command`
-//! argument, never shell text, so no interpolation or quoting risk exists.
-//! What argv-as-transport does cost is the platform's combined argv+environ
-//! size ceiling (`ARG_MAX`), which stdin never faced. [`MAX_PROMPT_BYTES`]
-//! keeps this adapter's composed prompt (already the smallest of any adapter,
-//! since it also carries no stdin-only content) comfortably inside every
-//! documented `ARG_MAX` this process is likely to run under, and prompt
-//! composition sheds the same optional navigation evidence Codex sheds before
-//! failing closed.
+//! Native opencode 1.18.33 reads piped input with `Bun.stdin.text()`. Stage
+//! prompts therefore use the same run-private immutable stdin transport as
+//! the other providers, never argv (which exposes prompts and has per-string
+//! operating-system limits independent of ARG_MAX).
 //!
-//! Permissions travel through a per-invocation config file passed as
-//! `OPENCODE_CONFIG`, kept for the record, but it is not the authority:
-//! verified by hand, a repository-controlled `opencode.json` (or
-//! `.opencode/opencode.json`) in the target worktree *overrides* it — a
-//! read-only `OPENCODE_CONFIG` next to a repo file granting
-//! `{"bash":"allow","edit":"allow"}` let the agent write a file. Every
-//! invocation therefore also sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`
-//! (verified: blocks project `opencode.json` and `.opencode/` entirely — it
-//! also stops opencode's own walk up parent directories for additional
-//! `AGENTS.md` files, an accepted trade-off, since the project-root
-//! `AGENTS.md` itself is still read unconditionally) and `OPENCODE_PERMISSION`
-//! carrying this invocation's own permission object as JSON (verified:
-//! merged on top of whatever config loaded, so it wins even if something
-//! else still resolves). `OPENCODE_PERMISSION`, not `OPENCODE_CONFIG`, is the
-//! actual authority; `OPENCODE_CONFIG` stays for a human inspecting the run's
-//! own artifacts. `--pure` (verified via the installed binary's own strings:
-//! gates loading of repository/user-supplied plugin code, distinct from
-//! opencode's own built-in plugins) is passed on every invocation too, since
-//! a plugin is arbitrary executable code and the class of risk is the same
-//! as the config-override one. `OPENCODE_DISABLE_EXTERNAL_SKILLS` and
-//! `OPENCODE_DISABLE_CLAUDE_CODE(_SKILLS)` were considered and declined:
-//! skills are capability/prompt content, not a bypass of the permission
-//! enforcement above, so disabling them would cost legitimate capability
-//! without closing a hole `OPENCODE_PERMISSION`/`--pure` do not already close.
-//! None of this is a credential, so it travels as ordinary process-spec argv
-//! and environment entries, never through the credential-handoff socket that
-//! exists for the user's own native authentication.
+//! OPENCODE_PERMISSION overrides global permissions, but not per-agent rules.
+//! The adapter audits resolved native configuration before launch and refuses
+//! agent/mode permission overrides. Both discovery and execution disable
+//! project configuration and external plugins. Native global configuration
+//! and per-vendor authentication remain available; configuration override
+//! environment variables must not introduce a different configuration into
+//! the audited and executing processes.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -51,17 +21,13 @@ use serde_json::{Value, json};
 
 use crate::domain::{EffortLevel, EffortSetting, ModelId, ProviderSessionId, StageKind};
 
-/// Conservative ceiling on the composed prompt, well inside every documented
-/// POSIX `ARG_MAX` (commonly 128 KiB–2 MiB, combined with the environment
-/// block) even though opencode's prompt already carries no other adapter's
-/// stdin-only content. Not verified against opencode itself: no automated
-/// probe here would be safe to run against real vendor credentials, so this
-/// is a documented margin rather than a measured limit.
+/// Resource limit for composed context, not an argv or operating-system limit.
 pub(crate) const MAX_PROMPT_BYTES: usize = 256 * 1024;
 
 pub(crate) struct OpencodeCommand {
     pub argv: Vec<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
+    pub stdin: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,9 +37,7 @@ pub(crate) enum OpencodeSandbox {
 }
 
 impl OpencodeSandbox {
-    /// Mirrors Codex's own stage-kind split exactly: `Implementation`, `Fix`,
-    /// and `FollowUp` write to the workspace; every other stage kind,
-    /// including both specialized reviewers, is read-only.
+    /// Mirrors Codex's stage-kind split, including simplification.
     pub(crate) const fn for_stage(kind: StageKind) -> Self {
         match kind {
             StageKind::Implementation
@@ -94,14 +58,8 @@ impl OpencodeSandbox {
         }
     }
 
-    /// The permission config this sandbox writes. Read-only denies edit,
-    /// bash, webfetch, and external-directory access outright (the exact
-    /// shape verified by hand against a real read-only run). Workspace-write
-    /// allows edit, still denies webfetch and external-directory access, and
-    /// gates bash behind an explicit allowlist derived from the repository's
-    /// own Claude allowlist (see [`bash_allow_patterns`]), asking for
-    /// anything else rather than allowing or silently denying it — headless
-    /// opencode auto-rejects an `ask` it cannot answer, so this never hangs.
+    /// Native permissions for one stage. The separate configuration audit
+    /// rejects per-agent overrides, which would otherwise supersede these.
     pub(crate) fn permission_config(self, bash_allow: &BTreeMap<String, String>) -> Value {
         match self {
             Self::ReadOnly => json!({
@@ -133,23 +91,13 @@ impl OpencodeSandbox {
     }
 }
 
-/// Converts the repository's own Claude `--allowedTools` bash allowlist (see
-/// `crate::providers::claude::permissions`) into opencode bash-permission
-/// glob patterns, so a repository states its safe commands once rather than
-/// once per provider. Only rules of the exact-prefix shape Claude itself uses
-/// for a plain command (`Bash(<prefix>:*)`) translate; every other rule
-/// (`Edit`, `mcp__*`, or a shape this function does not recognize) is simply
-/// not a bash pattern and is skipped rather than guessed at.
-///
-/// This inherits Claude's own baseline verbatim, `find *` and `sed *`/`awk *`
-/// included: `find -exec`/`-delete` and `awk`'s `system()` can in principle
-/// escape a command allowlist, but Claude's own baseline already accepts that
-/// same risk for the same reason (`Edit`/`Write` are already granted, so
-/// refusing the read-only-looking half of that risk protects nothing) — kept
-/// for parity rather than re-litigated here.
+/// Converts the shared Claude Bash(<prefix>:*) allowlist to native glob rules.
+/// Non-bash rules and unrecognized shapes are skipped, never guessed at.
+/// This retains the existing Claude baseline, including find/sed/awk and its
+/// associated shell-command risks; it is not an operating-system sandbox.
 ///
 /// # Errors
-/// Returns whatever reading the repository's `[permissions]` table returns.
+/// Returns whatever reading the repository's permissions table returns.
 pub(crate) fn bash_allow_patterns(
     worktree: &Path,
     source_repo: Option<&Path>,
@@ -170,21 +118,10 @@ pub(crate) fn bash_allow_patterns(
     Ok(patterns)
 }
 
-/// The one exact bash-permission pattern that replays one already-atomic
-/// command and nothing wider, or why it cannot be granted that way.
-///
-/// opencode's own bash-permission matcher reads every pattern as a glob, so a
-/// pattern equal to the command verbatim is only an exact replay when the
-/// command itself carries none of that glob's own special characters — `*`,
-/// `?`, or `[` would silently widen "grant this exact call" into "grant
-/// everything this also matches"; `{`/`}` (brace/group syntax) and `\`
-/// (escaping, which would change what the pattern itself means) are refused
-/// for the same reason. This is the same fail-closed reasoning behind
-/// Claude's own `--allowedTools` rule-syntax refusal.
+/// An exact permission pattern for an already-atomic command.
 ///
 /// # Errors
-/// Returns the reason a command cannot be granted as one exact pattern: it is
-/// empty, or it carries a character opencode's matcher treats specially.
+/// Refuses empty commands and glob/escape syntax that could widen a grant.
 pub(crate) fn exact_bash_pattern(command: &str) -> Result<String, String> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -201,20 +138,8 @@ pub(crate) fn exact_bash_pattern(command: &str) -> Result<String, String> {
     Ok(trimmed.to_owned())
 }
 
-/// Splits one denied bash command into opencode's own top-level parts — the
-/// exact granularity its permission check evaluates each sub-command at.
-/// Verified against a real run: `pwd && ls -la` was auto-rejected because
-/// opencode checked `pwd` and `ls -la` as two separate requests, so granting
-/// the whole joined string as one pattern (matching neither part) never took
-/// effect and the same denial repeated on every resume.
-///
-/// Splits on top-level `&&`, `||`, `;`, `|`, and newline — never inside
-/// single or double quotes, and never on an escaped character. Returns
-/// `None`, never a guess, the moment the command carries anything that makes
-/// the split uncertain: an unterminated quote, command substitution (`` ` ``
-/// or `$(`), brace/group syntax (`{`/`}`), or a bare redirection (`<`/`>`)
-/// outside quotes. A caller that gets `None` must fail closed rather than
-/// approve a pattern that might not mean what it looks like.
+/// Splits denied commands at opencode's top-level permission granularity.
+/// Refuses ambiguous shell syntax rather than guessing about a permission.
 pub(crate) fn split_top_level_commands(command: &str) -> Option<Vec<String>> {
     #[derive(PartialEq, Eq)]
     enum Quote {
@@ -301,14 +226,10 @@ pub(crate) fn split_top_level_commands(command: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-/// Every exact bash-permission pattern that replays one denied command,
-/// split at opencode's own top-level granularity — or the reason it cannot
-/// be granted that way, naming the exact command so the operator can decline
-/// it instead (`--skip` or `--response "<text>"`) when this refuses.
+/// Exact native patterns for every top-level part of a denied command.
 ///
 /// # Errors
-/// Returns [`split_top_level_commands`]'s refusal reason, or the first
-/// [`exact_bash_pattern`] refusal among the split parts.
+/// Refuses commands whose splitting or glob semantics are uncertain.
 pub(crate) fn exact_bash_patterns(command: &str) -> Result<Vec<String>, String> {
     let parts = split_top_level_commands(command).ok_or_else(|| {
         format!(
@@ -329,11 +250,10 @@ pub(crate) fn initial(
     config_path: &Path,
     permission: &Value,
 ) -> OpencodeCommand {
-    let mut argv = base(model, effort, workspace);
-    argv.push(OsString::from(prompt));
     OpencodeCommand {
-        argv,
+        argv: base(model, effort, workspace),
         environment: environment(config_path, permission),
+        stdin: prompt.as_bytes().to_vec(),
     }
 }
 
@@ -354,10 +274,10 @@ pub(crate) fn resume(
     let mut argv = base(model, effort, workspace);
     argv.push(OsString::from("--session"));
     argv.push(OsString::from(session_id.as_str()));
-    argv.push(OsString::from(prompt));
     OpencodeCommand {
         argv,
         environment: environment(config_path, permission),
+        stdin: prompt.as_bytes().to_vec(),
     }
 }
 
@@ -366,9 +286,6 @@ fn base(model: Option<&ModelId>, effort: EffortSetting, workspace: &Path) -> Vec
         OsString::from("run"),
         OsString::from("--format"),
         OsString::from("json"),
-        // Repository/user plugin code is arbitrary executable code, the same
-        // class of risk as the config-override vulnerability below; opencode's
-        // own built-in plugins are unaffected.
         OsString::from("--pure"),
     ];
     if let Some(model) = model {
@@ -384,13 +301,11 @@ fn base(model: Option<&ModelId>, effort: EffortSetting, workspace: &Path) -> Vec
     argv
 }
 
-/// `OPENCODE_PERMISSION` is the actual authority (verified to win a merge
-/// over whatever `OPENCODE_CONFIG`/project config resolved to);
-/// `OPENCODE_DISABLE_PROJECT_CONFIG` additionally keeps a repository's own
-/// `opencode.json`/`.opencode/opencode.json` from ever loading at all.
-/// `OPENCODE_CONFIG` stays too, kept for a human reading the run's own
-/// artifacts, not relied on for enforcement.
-fn environment(config_path: &Path, permission: &Value) -> BTreeMap<OsString, OsString> {
+/// Shared by execution and all discovery probes. Ambient configuration
+/// content/directories are cleared so they cannot reintroduce a project file
+/// or produce different configurations in the neutral probe directory and
+/// managed worktree. Global native config and vendor auth variables remain.
+pub(super) fn environment(config_path: &Path, permission: &Value) -> BTreeMap<OsString, OsString> {
     BTreeMap::from([
         (
             OsString::from("OPENCODE_CONFIG"),
@@ -404,14 +319,12 @@ fn environment(config_path: &Path, permission: &Value) -> BTreeMap<OsString, OsS
             OsString::from("OPENCODE_PERMISSION"),
             OsString::from(permission.to_string()),
         ),
+        (OsString::from("OPENCODE_CONFIG_DIR"), OsString::new()),
+        (OsString::from("OPENCODE_CONFIG_CONTENT"), OsString::new()),
     ])
 }
 
-/// Native opencode `--variant` value for one explicit requested level.
-/// opencode's variants are provider-specific (`high`, `max`, `minimal`, ...);
-/// The Senate's four ordered levels map onto the vendor-neutral words every
-/// provider in practice accepts, the same low/medium/high/xhigh spelling
-/// Codex's own `model_reasoning_effort` uses.
+/// Native opencode variant for an explicit effort level.
 pub(crate) const fn native_effort_value(level: EffortLevel) -> &'static str {
     match level {
         EffortLevel::Low => "low",
@@ -471,23 +384,69 @@ mod tests {
     }
 
     #[test]
-    fn prompt_is_the_final_positional_argument_and_never_touches_the_environment() {
-        let marker = "SUPER_SECRET_TASK_MARKER";
+    fn initial_and_resume_prompts_use_stdin_never_argv_or_environment() {
+        let marker = "SUPER_SECRET_TASK_MARKER\nquotes: \" ' \\ and Unicode: è\n";
+        for command in [
+            initial(
+                marker,
+                StageKind::Review,
+                None,
+                EffortSetting::NativeDefault,
+                Path::new("/managed/worktree"),
+                Path::new("/private/config.json"),
+                &sample_permission(),
+            ),
+            resume(
+                &ProviderSessionId::new("ses_A").unwrap(),
+                marker,
+                StageKind::Review,
+                None,
+                EffortSetting::NativeDefault,
+                Path::new("/managed/worktree"),
+                Path::new("/private/config.json"),
+                &sample_permission(),
+            ),
+        ] {
+            assert_eq!(command.stdin, marker.as_bytes());
+            assert!(command.argv.iter().all(|arg| arg != marker));
+            assert!(command.environment.values().all(|value| value != marker));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompts_above_linux_single_argument_limit_launch_and_round_trip_through_stdin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("opencode");
+        std::fs::write(&executable, "#!/bin/sh\nexec /bin/cat\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prompt = format!("{}\nquotes: \" ' \\ and Unicode: è\n", "x".repeat(150_000));
         let command = initial(
-            marker,
+            &prompt,
             StageKind::Review,
             None,
             EffortSetting::NativeDefault,
-            Path::new("/managed/worktree"),
-            Path::new("/private/config.json"),
+            directory.path(),
+            &directory.path().join("config.json"),
             &sample_permission(),
         );
-        assert_eq!(command.argv.last().map(|arg| arg == marker), Some(true));
-        assert!(command.environment.values().all(|value| value != marker));
+        let stdin_path = directory.path().join("stdin");
+        std::fs::write(&stdin_path, &command.stdin).unwrap();
+        let output = Command::new(executable)
+            .args(&command.argv)
+            .envs(&command.environment)
+            .stdin(Stdio::from(std::fs::File::open(stdin_path).unwrap()))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, prompt.as_bytes());
     }
 
     #[test]
-    fn every_invocation_carries_pure_and_the_two_config_override_defenses() {
+    fn every_invocation_carries_pure_and_the_config_override_defenses() {
         for command in [
             initial(
                 "prompt",
@@ -509,11 +468,7 @@ mod tests {
                 &sample_permission(),
             ),
         ] {
-            assert!(
-                strings(&command.argv).iter().any(|arg| arg == "--pure"),
-                "{:?}",
-                command.argv
-            );
+            assert!(strings(&command.argv).iter().any(|arg| arg == "--pure"));
             assert_eq!(
                 command
                     .environment
@@ -523,15 +478,17 @@ mod tests {
             let permission = command
                 .environment
                 .get(&OsString::from("OPENCODE_PERMISSION"))
-                .expect("OPENCODE_PERMISSION must be set");
-            let decoded: Value =
-                serde_json::from_str(&permission.to_string_lossy()).expect("valid JSON");
+                .unwrap();
+            let decoded: Value = serde_json::from_str(&permission.to_string_lossy()).unwrap();
             assert_eq!(decoded, sample_permission());
+            for name in ["OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT"] {
+                assert_eq!(command.environment.get(&OsString::from(name)), Some(&OsString::new()));
+            }
         }
     }
 
     #[test]
-    fn model_and_workdir_reach_argv() {
+    fn model_and_workspace_are_explicit_without_auto() {
         let command = initial(
             "task",
             StageKind::Implementation,
@@ -542,14 +499,8 @@ mod tests {
             &sample_permission(),
         );
         let args = strings(&command.argv);
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["-m", "opencode-go/deepseek-v4-pro"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--dir", "/managed/worktree"])
-        );
+        assert!(args.windows(2).any(|pair| pair == ["-m", "opencode-go/deepseek-v4-pro"]));
+        assert!(args.windows(2).any(|pair| pair == ["--dir", "/managed/worktree"]));
         assert!(!args.iter().any(|arg| arg == "--auto"));
     }
 
@@ -581,7 +532,7 @@ mod tests {
             Path::new("/private/run/config.json"),
             &sample_permission(),
         );
-        assert_eq!(command.environment.len(), 3);
+        assert_eq!(command.environment.len(), 5);
         assert_eq!(
             command.environment.get(&OsString::from("OPENCODE_CONFIG")),
             Some(&OsString::from("/private/run/config.json"))
@@ -596,11 +547,7 @@ mod tests {
             StageKind::Fix,
             StageKind::FollowUp,
         ] {
-            assert_eq!(
-                OpencodeSandbox::for_stage(kind),
-                OpencodeSandbox::WorkspaceWrite,
-                "{kind:?}"
-            );
+            assert_eq!(OpencodeSandbox::for_stage(kind), OpencodeSandbox::WorkspaceWrite, "{kind:?}");
         }
         for kind in [
             StageKind::Research,
@@ -611,29 +558,17 @@ mod tests {
             StageKind::Decision,
             StageKind::Verify,
         ] {
-            assert_eq!(
-                OpencodeSandbox::for_stage(kind),
-                OpencodeSandbox::ReadOnly,
-                "{kind:?}"
-            );
+            assert_eq!(OpencodeSandbox::for_stage(kind), OpencodeSandbox::ReadOnly, "{kind:?}");
         }
     }
 
     #[test]
     fn read_only_config_matches_the_verified_real_shape() {
         let config = OpencodeSandbox::ReadOnly.permission_config(&BTreeMap::new());
-        assert_eq!(
-            config,
-            json!({
-                "$schema": "https://opencode.ai/config.json",
-                "permission": {
-                    "edit": "deny",
-                    "bash": "deny",
-                    "webfetch": "deny",
-                    "external_directory": "deny",
-                }
-            })
-        );
+        assert_eq!(config, json!({
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {"edit":"deny", "bash":"deny", "webfetch":"deny", "external_directory":"deny"}
+        }));
     }
 
     #[test]
@@ -652,14 +587,8 @@ mod tests {
     fn bash_allow_patterns_translate_the_shared_claude_allowlist() {
         let worktree = tempfile::tempdir().unwrap();
         let patterns = bash_allow_patterns(worktree.path(), None).unwrap();
-        // The baseline every Claude run starts with also seeds opencode's
-        // bash allowlist: the repository states its safe commands once.
         assert_eq!(patterns.get("grep *").map(String::as_str), Some("allow"));
-        assert_eq!(
-            patterns.get("git status *").map(String::as_str),
-            Some("allow")
-        );
-        // Non-bash rules (Edit, MultiEdit, Write) are not bash patterns.
+        assert_eq!(patterns.get("git status *").map(String::as_str), Some("allow"));
         assert!(!patterns.contains_key("Edit *"));
     }
 
@@ -672,13 +601,9 @@ mod tests {
         )
         .unwrap();
         let patterns = bash_allow_patterns(worktree.path(), None).unwrap();
-        assert_eq!(
-            patterns.get("cargo test *").map(String::as_str),
-            Some("allow")
-        );
+        assert_eq!(patterns.get("cargo test *").map(String::as_str), Some("allow"));
     }
 
-    /// Real end-to-end shape: the denied command from a run's own evidence.
     #[test]
     fn exact_bash_pattern_accepts_a_plain_command_verbatim() {
         let command = "python3 -c \"from calc import add; assert add(2,3)==5; print('ok')\"";
@@ -687,83 +612,42 @@ mod tests {
 
     #[test]
     fn exact_bash_pattern_refuses_glob_syntax_that_would_widen_the_grant() {
-        for command in [
-            "rm *.txt",
-            "cat file?.log",
-            "ls [ab]*",
-            "echo {a,b}",
-            "echo \\x",
-        ] {
-            assert!(
-                exact_bash_pattern(command).is_err(),
-                "{command} must be refused"
-            );
+        for command in ["rm *.txt", "cat file?.log", "ls [ab]*", "echo {a,b}", "echo \\x"] {
+            assert!(exact_bash_pattern(command).is_err(), "{command} must be refused");
         }
         assert!(exact_bash_pattern("").is_err());
         assert!(exact_bash_pattern("   ").is_err());
     }
 
-    /// Real end-to-end shape: `pwd && ls -la` was auto-rejected because
-    /// opencode checked `pwd` and `ls -la` separately (its own stderr named
-    /// both: `permission requested: bash (pwd, ls -la); auto-rejecting`).
-    /// Granting the whole joined string never took effect; splitting it the
-    /// way opencode does does.
     #[test]
     fn split_top_level_commands_matches_opencodes_own_split_of_a_real_denied_command() {
-        assert_eq!(
-            split_top_level_commands("pwd && ls -la"),
-            Some(vec!["pwd".to_owned(), "ls -la".to_owned()])
-        );
+        assert_eq!(split_top_level_commands("pwd && ls -la"), Some(vec!["pwd".to_owned(), "ls -la".to_owned()]));
     }
 
     #[test]
     fn split_top_level_commands_handles_every_top_level_separator() {
-        assert_eq!(
-            split_top_level_commands("a || b; c | d\ne"),
-            Some(vec![
-                "a".to_owned(),
-                "b".to_owned(),
-                "c".to_owned(),
-                "d".to_owned(),
-                "e".to_owned()
-            ])
-        );
+        assert_eq!(split_top_level_commands("a || b; c | d\ne"), Some(vec![
+            "a".to_owned(), "b".to_owned(), "c".to_owned(), "d".to_owned(), "e".to_owned()
+        ]));
     }
 
     #[test]
     fn split_top_level_commands_never_splits_inside_quotes() {
-        assert_eq!(
-            split_top_level_commands("echo 'a && b' && echo \"c ; d\""),
-            Some(vec![
-                "echo 'a && b'".to_owned(),
-                "echo \"c ; d\"".to_owned()
-            ])
-        );
+        assert_eq!(split_top_level_commands("echo 'a && b' && echo \"c ; d\""), Some(vec![
+            "echo 'a && b'".to_owned(), "echo \"c ; d\"".to_owned()
+        ]));
     }
 
     #[test]
     fn split_top_level_commands_fails_closed_on_ambiguous_shell() {
         for command in [
-            "echo `whoami`",
-            "echo $(whoami)",
-            "echo 'unterminated",
-            "echo \"unterminated",
-            "{ echo a; }",
-            "echo a > out.txt",
-            "cat < in.txt",
-            "echo a &&",
-            "&& echo a",
+            "echo `whoami`", "echo $(whoami)", "echo 'unterminated", "echo \"unterminated",
+            "{ echo a; }", "echo a > out.txt", "cat < in.txt", "echo a &&", "&& echo a",
         ] {
-            assert_eq!(
-                split_top_level_commands(command),
-                None,
-                "{command} must be refused as ambiguous"
-            );
+            assert_eq!(split_top_level_commands(command), None, "{command} must be refused as ambiguous");
         }
     }
 
-    /// Command substitution and a bare redirection stay refused even inside
-    /// double quotes, where the shell still expands/honours them.
     #[test]
     fn split_top_level_commands_refuses_substitution_inside_double_quotes() {
         assert_eq!(split_top_level_commands("echo \"$(whoami)\""), None);
@@ -772,10 +656,7 @@ mod tests {
 
     #[test]
     fn exact_bash_patterns_grants_each_split_part_of_a_compound_command() {
-        assert_eq!(
-            exact_bash_patterns("pwd && ls -la").unwrap(),
-            vec!["pwd".to_owned(), "ls -la".to_owned()]
-        );
+        assert_eq!(exact_bash_patterns("pwd && ls -la").unwrap(), vec!["pwd".to_owned(), "ls -la".to_owned()]);
     }
 
     #[test]
@@ -786,8 +667,6 @@ mod tests {
     }
 
     fn strings(argv: &[OsString]) -> Vec<String> {
-        argv.iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect()
+        argv.iter().map(|arg| arg.to_string_lossy().into_owned()).collect()
     }
 }
