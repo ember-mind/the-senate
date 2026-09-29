@@ -249,7 +249,8 @@ fn run_id(stdout: &str) -> &str {
 fn attention_id(stdout: &str) -> String {
     stdout
         .lines()
-        .find_map(|line| line.split_once(" · ")?;
+        .find_map(|line| {
+            let (id, rest) = line.split_once(" · ")?;
             rest.contains("permission").then(|| id.to_owned())
         })
         .expect("a pending permission attention line")
