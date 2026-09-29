@@ -370,7 +370,6 @@ mod tests {
                 StageKind::Review,
                 None,
                 setting,
-                EffortSetting::NativeDefault,
                 Path::new("/managed/worktree"),
                 Path::new("/private/config.json"),
                 &sample_permission(),
