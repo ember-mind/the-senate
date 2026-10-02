@@ -12,11 +12,12 @@ exclude = [".project-meta.yaml", "PROJECT.md", "ZSHRC-FUNCTION.txt"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28.1"
 ratatui = "0.29.0"
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +30,7 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ulid = { version = "1", features = ["serde"] }
+url = "2"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [lints.rust]

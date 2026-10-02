@@ -11,6 +11,10 @@ pub enum IdError {
     Empty,
     #[error("identifier must not contain whitespace: {0:?}")]
     ContainsWhitespace(String),
+    #[error("identifier must not contain control characters: {0:?}")]
+    ContainsControl(String),
+    #[error("stage identifier must be one plain filename component: {0:?}")]
+    InvalidStageId(String),
     #[error("invalid ULID: {0:?}")]
     InvalidUlid(String),
 }
@@ -23,11 +27,21 @@ fn validate_string_id(value: impl Into<String>) -> Result<String, IdError> {
     if value.chars().any(char::is_whitespace) {
         return Err(IdError::ContainsWhitespace(value));
     }
+    if value.chars().any(char::is_control) {
+        return Err(IdError::ContainsControl(value));
+    }
+    Ok(value)
+}
+
+fn validate_stage_id(value: String) -> Result<String, IdError> {
+    if matches!(value.as_str(), "." | "..") || value.contains(['/', '\\']) {
+        return Err(IdError::InvalidStageId(value));
+    }
     Ok(value)
 }
 
 macro_rules! string_id {
-    ($(#[$metadata:meta])* $name:ident) => {
+    ($(#[$metadata:meta])* $name:ident $(, $validator:ident)?) => {
         $(#[$metadata])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
         #[serde(transparent)]
@@ -37,9 +51,12 @@ macro_rules! string_id {
             /// Creates a validated identifier.
             ///
             /// # Errors
-            /// Returns [`IdError`] when value is empty or contains whitespace.
+            /// Returns [`IdError`] when the value is empty, contains whitespace
+            /// or control characters, or violates this identifier's shape.
             pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
-                validate_string_id(value).map(Self)
+                let value = validate_string_id(value)?;
+                $(let value = $validator(value)?;)?
+                Ok(Self(value))
             }
 
             #[must_use]
@@ -149,7 +166,7 @@ ulid_id!(
 
 string_id!(
     /// Stable workflow-local identity for one stage.
-    StageId
+    StageId, validate_stage_id
 );
 string_id!(
     /// Identity of immutable effective configuration bound to a run.
@@ -185,6 +202,25 @@ mod tests {
             "deep_analysis"
         );
         assert!(serde_json::from_str::<StageId>(r#""two words""#).is_err());
+    }
+
+    #[test]
+    fn stage_ids_cannot_escape_run_private_artifact_paths() {
+        for value in [
+            "../outside",
+            "/tmp/outside",
+            "nested/stage",
+            "nested\\stage",
+            ".",
+            "..",
+            "stage\0hidden",
+            "stage\u{1b}hidden",
+        ] {
+            assert!(StageId::new(value).is_err(), "accepted {value:?}");
+            let json = serde_json::to_string(value).unwrap();
+            assert!(serde_json::from_str::<StageId>(&json).is_err());
+        }
+        assert!(super::ModelId::new("vendor/model").is_ok());
     }
 
     #[test]

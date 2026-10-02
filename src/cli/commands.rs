@@ -44,6 +44,7 @@ pub fn execute(command: Option<&Command>) -> Result<()> {
         Some(Command::Tui) => anyhow::bail!("TUI dispatch must be handled before CLI commands"),
         Some(Command::World(args)) => world(args),
         Some(Command::Mission { command }) => mission(command),
+        Some(Command::Jira { command }) => crate::jira::execute(command),
         Some(Command::Eval { command }) => eval(command),
         Some(Command::Update(args)) => update(*args),
         Some(Command::Doctor) => doctor(),
@@ -225,14 +226,14 @@ fn start(workflow: WorkflowKind, args: &RunArgs) -> Result<()> {
     } else {
         crate::app::ImageGenerationPlan::disabled()
     };
-    let report = service()?.start_run(
-        workflow,
-        args.task.clone(),
-        &args.repo,
-        selection,
-        effort,
-        &image,
-    )?;
+    let task = match (&args.task, &args.jira) {
+        (Some(task), None) => task.clone(),
+        (None, Some(issue)) => crate::jira::Client::from_environment()?
+            .issue(issue)?
+            .input(),
+        _ => anyhow::bail!("provide task text or --jira, exclusively"),
+    };
+    let report = service()?.start_run(workflow, task, &args.repo, selection, effort, &image)?;
     print_report(&report);
     Ok(())
 }

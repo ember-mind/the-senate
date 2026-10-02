@@ -4,6 +4,60 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[test]
+fn official_registration_requires_a_successful_bounded_version_probe() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new();
+    let candidate = fixture.repo.join("candidate");
+    for (body, error) in [
+        (
+            format!(
+                "#!/bin/sh\necho senate {}\nexit 42\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "Code(42)",
+        ),
+        (
+            format!(
+                "#!/bin/sh\nhead -c 70000 /dev/zero\necho senate {}\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "64 KiB",
+        ),
+    ] {
+        fs::write(&candidate, body).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_senate"))
+            .args(["__register-official-install", "candidate"])
+            .current_dir(&fixture.repo)
+            .env("SENATE_DATA_DIR", &fixture.data)
+            .env("SENATE_DISABLE_UPDATE_CHECK", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(error),
+            "{output:?}"
+        );
+        assert!(!fixture.data.join("install.json").exists());
+    }
+    fs::write(
+        &candidate,
+        format!("#!/bin/sh\necho senate {}\n", env!("CARGO_PKG_VERSION")),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_senate"))
+        .args(["__register-official-install", "candidate"])
+        .current_dir(&fixture.repo)
+        .env("SENATE_DATA_DIR", &fixture.data)
+        .env("SENATE_DISABLE_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(fixture.data.join("install.json").exists());
+}
+
 #[test]
 fn deep_command_survives_process_restart_and_status_is_read_only() {
     let fixture = Fixture::new();

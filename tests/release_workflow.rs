@@ -93,6 +93,7 @@ fn the_quality_gate_runs_the_full_check_suite() {
         "cargo clippy --all-targets --all-features -- -D warnings",
         "cargo test --test process_tmux --no-fail-fast",
         "cargo test",
+        "node --experimental-vm-modules tests/world_ui.mjs",
     ] {
         assert!(
             quality.contains(command),

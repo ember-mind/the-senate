@@ -3,6 +3,8 @@
 Run the target repository's own verification commands inside the run's worktree after the last stage that edits it, record every command and exit code, and let the change be applied to the operator's checkout only once the latest verification passed. No agent is involved.
 
 ## Sub-features
+- shared-runner: repository setup, Verify, Evaluation validation and installer version probes share direct-argv execution, bounded stdout/stderr and process-group timeout handling.
+- jira-credentials: verification commands omit Jira importer credentials from their environment.
 - verify-stage: `StageKind::Verify` / `Role::Verifier`, stage id `verify` in Fast, Standard and Deep (`verify_<n>` in a fix cycle, `followup_verify_<n>` in a continue cycle); absent from Review, which edits nothing.
 - placement: after the last editing stage (Implementation in Fast, Simplification in Standard/Deep, the Fix or FollowUp in a cycle); beside the two reviews, not after them. The Decision depends on it *optionally*: it waits for the verdict and receives the artifact, but a failed verification still reaches the lead and the run still completes.
 - verify-provider: provider id `verify`, a synchronous command runner; every `Role::Verifier` stage routes to it implicitly, never through a routing snapshot or profile.
@@ -38,6 +40,7 @@ timeout_seconds = 1800
 ```
 
 ## Where it lives
+- `src/exec.rs` — shared process-group termination and importer credential filtering.
 - `src/providers/verify/mod.rs` — `VerifyProvider`, two polls per attempt (start, then run everything), idempotent re-poll from the recorded artifact.
 - `src/providers/verify/config.rs` — `.senate.toml` `[verify]` reader, detection rules, `DEFAULT_TIMEOUT` (1800 s).
 - `src/providers/repo_config.rs` — which checkout `.senate.toml` is read from (`locate`, `ConfigOrigin`), shared with the `[permissions]` and `[setup]` readers.
@@ -55,7 +58,7 @@ timeout_seconds = 1800
 ## Gotchas
 - Synchronous: the whole command sequence runs inside one provider poll, so a long test suite blocks the driving process (CLI command or TUI worker) for its duration. The default limit is 1800 s per command.
 - `stop` does not stop a running verification: the commands are not managed processes, so the poll runs the suite to its end; the driver then fails its commit with a concurrency error and the run's state is reconciled on the next `resume`. Nothing is lost, but the suite finishes first.
-- A timeout kills the whole process group of the command (test runners fork workers that would otherwise keep the output pipes open); it is reported as `timed out after N s`.
+- The timeout covers both the command and draining its output, including descendants keeping pipes open after the command exits. A timeout kills and reaps the whole process group; it is reported as `timed out after N s`.
 - Commands are argv, not shell: the string is split on whitespace and the first word is the program. No pipes, globs, redirections, `&&` or environment expansion; write a script in the repository and name it instead.
 - The first failure stops the sequence; later commands are listed as skipped in the artifact and never run.
 - Nothing detected means nothing checked: the stage completes with `nothing checked — no commands configured or detected` and the run can be applied. A repository with no recognised build file verifies nothing unless it says otherwise in `.senate.toml`.

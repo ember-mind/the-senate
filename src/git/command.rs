@@ -72,7 +72,7 @@ impl Git {
         environment: &[(OsString, OsString)],
     ) -> Result<GitOutput, GitError> {
         let description = describe_command(&self.executable, cwd, args);
-        let mut command = Command::new(&self.executable);
+        let mut command = crate::exec::without_jira_credentials(Command::new(&self.executable));
         command
             .current_dir(cwd)
             .args(args)
@@ -138,7 +138,7 @@ impl Git {
         stdout: File,
     ) -> Result<(), GitError> {
         let description = describe_command(&self.executable, cwd, args);
-        let mut command = Command::new(&self.executable);
+        let mut command = crate::exec::without_jira_credentials(Command::new(&self.executable));
         command
             .current_dir(cwd)
             .args(args)

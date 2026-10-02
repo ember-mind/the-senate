@@ -88,9 +88,26 @@ pub(crate) fn run(
     let program = words
         .next()
         .ok_or_else(|| VerifyError::Config("verify command is empty".to_owned()))?;
-    let mut spawn = Command::new(program);
+    Ok(run_argv(
+        command,
+        program,
+        &words.collect::<Vec<_>>(),
+        cwd,
+        timeout,
+    ))
+}
+
+/// Shared command supervision for callers that already own exact argv.
+pub(crate) fn run_argv(
+    command: &str,
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> CommandReport {
+    let mut spawn = crate::exec::without_jira_credentials(Command::new(program));
     spawn
-        .args(words)
+        .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -107,12 +124,12 @@ pub(crate) fn run(
     let mut child = match crate::exec::retry_busy(|| spawn.spawn()) {
         Ok(child) => child,
         Err(error) => {
-            return Ok(CommandReport {
+            return CommandReport {
                 command: command.to_owned(),
                 exit: CommandExit::CouldNotStart(error.to_string()),
                 stdout: Captured::default(),
                 stderr: Captured::default(),
-            });
+            };
         }
     };
     let stdout = child.stdout.take();
@@ -120,19 +137,21 @@ pub(crate) fn run(
     let (exit, stdout, stderr) = std::thread::scope(|scope| {
         let stdout = scope.spawn(move || drain(stdout));
         let stderr = scope.spawn(move || drain(stderr));
-        let exit = wait_with_timeout(&mut child, timeout);
+        let exit = wait_with_timeout(&mut child, timeout, || {
+            stdout.is_finished() && stderr.is_finished()
+        });
         (
             exit,
             stdout.join().unwrap_or_default(),
             stderr.join().unwrap_or_default(),
         )
     });
-    Ok(CommandReport {
+    CommandReport {
         command: command.to_owned(),
         exit,
         stdout,
         stderr,
-    })
+    }
 }
 
 /// Reads a stream to its end keeping only the last [`CAPTURE_TAIL_BYTES`],
@@ -171,40 +190,27 @@ fn drain(stream: Option<impl Read>) -> Captured {
 /// tree. Every kill is followed by a wait so the leader is reaped; its
 /// descendants die with the group, which closes the pipes and lets the
 /// draining threads finish.
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> CommandExit {
+fn wait_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+    output_finished: impl Fn() -> bool,
+) -> CommandExit {
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return exit_of(status),
-            Ok(None) => {}
+            Ok(Some(status)) if output_finished() => return exit_of(status),
+            Ok(_) => {}
             Err(error) => {
-                kill_tree(child);
+                crate::exec::kill_process_tree(child);
                 return CommandExit::StatusUnavailable(error.to_string());
             }
         }
         if started.elapsed() >= timeout {
-            kill_tree(child);
+            crate::exec::kill_process_tree(child);
             return CommandExit::TimedOut(timeout);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-}
-
-/// Kills the child and, on Unix, every process in the group it leads.
-fn kill_tree(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        // The child was spawned as a group leader, so its pid is the group
-        // id. A failure here (the group is already gone) changes nothing.
-        if let Some(pid) = i32::try_from(child.id())
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn exit_of(status: std::process::ExitStatus) -> CommandExit {
@@ -262,6 +268,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(4),
             "the runner must not wait for the child's own exit"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_still_applies_when_the_leader_exits_with_descendants_holding_pipes() {
+        let dir = cwd();
+        let script = dir.path().join("background.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 6 &\necho leader-done\nexit 0\n").unwrap();
+        let started = Instant::now();
+        let report = run(
+            &format!("sh {}", script.display()),
+            dir.path(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(report.exit, CommandExit::TimedOut(Duration::from_secs(1)));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "descendant held output pipes open"
+        );
+        assert_eq!(report.stdout.bytes, b"leader-done\n");
     }
 
     /// Test runners fork workers that inherit the pipes. Killing only the

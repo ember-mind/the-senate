@@ -5,6 +5,7 @@ Know where The Senate keeps its state and which environment variables change its
 ## Sub-features
 - config-path: `$SENATE_CONFIG_DIR/config.toml`, else `$XDG_CONFIG_HOME/senate/config.toml`, else `$HOME/.config/senate/config.toml`; resolved, printed by `doctor`, but never read or created.
 - repo-config: `<repo>/.senate.toml`, read from the run's worktree, else from the source repository the worktree was cut from; its `[verify]` table (`commands`, `timeout_seconds`) by the Verify stage (see verification.md), its `[setup]` table (`commands`, `timeout_seconds`) by workspace preparation (see workspace.md), and its `[permissions]` table (`allow`) by the Claude adapter (see providers.md).
+- jira: `SENATE_JIRA_KIND` (`cloud` or `data-center`), `SENATE_JIRA_URL`, `SENATE_JIRA_TOKEN`, Cloud-only `SENATE_JIRA_EMAIL`, optional `SENATE_JIRA_ACCEPTANCE_FIELD`; read only by explicit Jira commands or workflow `--jira`. See [jira.md](jira.md).
 - data-dir: `SENATE_DATA_DIR` relocates the SQLite database (`senate.db`), managed worktrees (`worktrees/`), process data (`runs/<run-id>/processes/`), artifacts, `update.json` and `install.json`. Default `~/.senate`.
 - appearance: `NO_COLOR`, `SENATE_THEME` (`vivid` or default `native`), `SENATE_MOTION` (`off`, `reduced`, default), `COLORTERM` (read only to decide whether `vivid` can render).
 - update-kill-switch: `SENATE_DISABLE_UPDATE_CHECK=1` stops every network check, typed or automatic.
@@ -57,5 +58,5 @@ allow = ["Bash(yarn jest:*)", "Bash(yarn lint:css:*)", "mcp__linear-server"]
 - An empty `NO_COLOR` is not a request for mono; only present-and-non-empty counts. `TERM=dumb` behaves like `NO_COLOR`.
 - `vivid` on a terminal without truecolor falls back to the named ANSI palette; `NO_COLOR` outranks it.
 - Read screens (artifact, logs, diff, composer) and every overlay never animate regardless of `SENATE_MOTION`; the variable can only lower what a screen permits.
-- Only the allowlist in `safe_environment_name` (HOME, PATH, LANG, TERM, XDG_*, CLAUDE_CONFIG_DIR, GIT_CONFIG_*, SSH_AUTH_SOCK, ...) enters the tmux session; other provider variables cross once through a `0600` Unix socket into runner memory. `SENATE_*` variables set for the parent do not reach the provider.
+- Only the allowlist in `safe_environment_name` (HOME, PATH, LANG, TERM, XDG_*, CLAUDE_CONFIG_DIR, GIT_CONFIG_*, SSH_AUTH_SOCK, ...) enters the tmux session; other provider variables cross once through a `0600` Unix socket into runner memory. `SENATE_JIRA_*` variables are excluded from that handoff and from provider exec. `SENATE_*` variables set for the parent do not reach the provider.
 - Database triggers reject update/delete on run inputs, config snapshots and artifacts; do not try to edit them through SQL.

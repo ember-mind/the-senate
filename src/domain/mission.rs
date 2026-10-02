@@ -55,9 +55,10 @@ impl MissionStatus {
 /// cancelled by discarding the run first
 /// ```
 ///
-/// `Ready` means every dependency is `Integrated`, so a run started for the
-/// package sees their changes in its base. `Delivered` means the child run
-/// completed; `Integrated` means its change reached the source checkout.
+/// `Ready` means every dependency is `Integrated`. Before starting the next
+/// package, the operator commits the integrated changes so its run's base
+/// contains them. `Delivered` means the child run completed; `Integrated`
+/// means its change reached the source checkout, without staging or committing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkPackageStatus {

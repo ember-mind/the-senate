@@ -1,5 +1,5 @@
-//! Retries a subprocess launch that raced another test's still-forking
-//! thread.
+//! Shared subprocess credential filtering, process-group cleanup and launch
+//! retries for a test's still-forking thread.
 //!
 //! Tests that write a stub executable (a fake `gh`, `codex`, or a staged
 //! release binary) and immediately exec it can hit `ETXTBSY`
@@ -17,6 +17,40 @@ use std::time::Duration;
 const MAX_ATTEMPTS: u32 = 5;
 /// Backoff before the first retry; doubles on each attempt after that.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Reaps a command started as its own process-group leader, including the
+/// descendants that may still hold its output pipes after the leader exits.
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Jira configuration belongs to the input importer, not child tools.
+pub(crate) fn jira_environment_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with("SENATE_JIRA_"))
+}
+
+/// Preserve native tool authentication while withholding Jira importer secrets.
+pub(crate) fn without_jira_credentials(
+    mut command: std::process::Command,
+) -> std::process::Command {
+    for (key, _) in std::env::vars_os().filter(|(key, _)| jira_environment_name(key)) {
+        command.env_remove(key);
+    }
+    // Record removal of known credentials even when absent from this environment.
+    command
+        .env_remove("SENATE_JIRA_TOKEN")
+        .env_remove("SENATE_JIRA_EMAIL");
+    command
+}
 
 /// Runs `attempt`, retrying only when it fails with
 /// [`io::ErrorKind::ExecutableFileBusy`], up to [`MAX_ATTEMPTS`] times with a
@@ -42,6 +76,21 @@ pub(crate) fn retry_busy<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jira_credentials_are_removed_without_clearing_native_auth() {
+        let command = without_jira_credentials(std::process::Command::new("native-provider"));
+        let removals = command.get_envs().collect::<Vec<_>>();
+        assert!(removals.contains(&(std::ffi::OsStr::new("SENATE_JIRA_TOKEN"), None)));
+        assert!(removals.contains(&(std::ffi::OsStr::new("SENATE_JIRA_EMAIL"), None)));
+        assert!(!removals.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
+        assert!(jira_environment_name(std::ffi::OsStr::new(
+            "SENATE_JIRA_TOKEN"
+        )));
+        assert!(!jira_environment_name(std::ffi::OsStr::new(
+            "OPENAI_API_KEY"
+        )));
+    }
 
     #[test]
     fn a_non_busy_error_returns_on_the_first_attempt() {

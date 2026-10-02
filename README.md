@@ -137,7 +137,7 @@ Full command list: `senate --help`, or [docs/features/README.md](docs/features/R
 
 ### Verification
 
-After the last stage that edits the worktree, the Senate runs your repository's own checks there — no agent involved — and records every command and exit code. In Standard and Deep, a failed check doesn't fail the run; the decision sees it and `fix` can answer it, but `apply` and `pr` refuse by name until a later verification passes. Declare it in `<repo>/.senate.toml`:
+After the last stage that edits the worktree, the Senate runs your repository's own checks there — no agent involved — and records every command and exit code. In Standard and Deep, a failed check doesn't fail the run; the decision sees it and `fix` can answer it, but `apply` refuses by name until a later verification passes. `pr` remains available; its confirmation names the failed check. Declare it in `<repo>/.senate.toml`:
 
 ```toml
 [verify]
@@ -192,9 +192,12 @@ Automatic installation applies only to an official release binary the Senate its
 cargo build
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+node --experimental-vm-modules tests/world_ui.mjs
 ```
 
-Requires Rust stable 1.85+, Git, and tmux. Claude Code and/or Codex CLIs, authenticated normally, are needed only for `--provider claude`/`--provider codex`; ordinary tests use a deterministic fake provider and need neither.
+Requires Rust stable 1.88+, Git, and tmux. Claude Code and/or Codex CLIs, authenticated normally, are needed only for `--provider claude`/`--provider codex`; ordinary tests use a deterministic fake provider and need neither.
+
+The World UI regression harness also needs Node.js 18+; CI and the release quality gate run it alongside the Rust checks.
 
 ## Configuration
 
@@ -215,3 +218,7 @@ Gemini, runtime failover, custom routing, an async runtime, a native process bac
 ## License
 
 Licensed under either Apache License 2.0 or MIT license, at your option.
+
+### Jira input
+
+The Senate can import Jira Cloud or Jira Data Center issues as immutable Run input, and JQL selections as Mission work packages. Configure the instance and credentials in environment variables, then use `senate standard --jira PROJ-123`, `senate jira show PROJ-123`, `senate jira search "project = PROJ"`, or `senate jira mission`. See [Jira configuration and commands](docs/features/jira.md). Import is read-only; no Jira status changes or comments are sent.

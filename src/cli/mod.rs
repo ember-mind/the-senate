@@ -57,6 +57,11 @@ pub enum Command {
         #[command(subcommand)]
         command: MissionCommand,
     },
+    /// Read Jira Cloud or Data Center issues and import a mission.
+    Jira {
+        #[command(subcommand)]
+        command: JiraCommand,
+    },
     /// Experimental role-specific provider/model evaluation tools.
     Eval {
         #[command(subcommand)]
@@ -386,10 +391,40 @@ pub struct EvalRunArgs {
     pub out: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum JiraCommand {
+    /// Print an issue's normalized input without creating a run.
+    Show { issue: String },
+    /// Search issues with JQL (fails rather than silently truncating).
+    Search {
+        jql: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Create a mission with one work package per matching issue.
+    Mission {
+        title: String,
+        #[arg(long)]
+        goal: String,
+        #[arg(long)]
+        jql: String,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value = "standard", value_parser = ["fast", "standard", "deep", "review"])]
+        workflow: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Args)]
 pub struct RunArgs {
     /// Task sent unchanged to each provider stage after outer trim normalization.
-    pub task: String,
+    #[arg(required_unless_present = "jira", conflicts_with = "jira")]
+    pub task: Option<String>,
+    /// Import immutable run input from a Jira issue key or browse URL.
+    #[arg(long)]
+    pub jira: Option<String>,
     /// Git repository; defaults to current directory.
     #[arg(long, default_value = ".")]
     pub repo: PathBuf,

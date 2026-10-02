@@ -3,6 +3,10 @@
 Let the Implementer generate original PNG images into the run's worktree through a Senate-owned tool whose backend is the user's own Codex CLI and its built-in `image_gen` tool (native ChatGPT auth, no API key), while the PNG stays an ordinary worktree change.
 
 ## Sub-features
+- bounded-stdio: the MCP shim limits each JSON-RPC line to 64 KiB (including its newline) before UTF-8 decoding or JSON parsing. Oversized or invalid UTF-8 frames terminate the shim promptly; malformed JSON within the limit receives a protocol error. Multiple frames and an unterminated final frame are supported.
+- structural-validation: PNG signature, legal IHDR settings, chunk lengths and CRCs, nonempty IDAT and a final IEND are checked before writing; this does not decompress or visually inspect pixels. Containment is checked again before creating output directories and after creation, so an ancestor replaced by an escaping symlink is refused before creating directories outside the worktree.
+- backend-timeout: the 300 s limit covers the Codex process and output draining; a descendant holding pipes open after Codex exits still times out. Timeout and I/O failures kill and reap the process group.
+- jira-credentials: the image backend Codex subprocess omits Jira importer credentials.
 - authorization: `--allow-image-generation` on any workflow command seals an `image_generation` block in config schema v4 (`roles: ["implementer"]`, `max_generations: 4`); every run without the flag keeps its byte-identical v2/v3 payload and no tool. Resume, retry, fix and continue read the grant from the snapshot only.
 - tool surface: one MCP tool, `image_generate(prompt, output_path, size?, quality?, transparent_background?)`, exposed to the granted role's native CLI only. Claude sees it as `mcp__senate_image__image_generate` (pre-allowed under `dontAsk`); Codex sees `image_generate` on server `senate_image`.
 - run-scoped MCP: Claude gets `--mcp-config <json>` + `--allowedTools mcp__senate_image__image_generate`; Codex gets `-c mcp_servers.senate_image.command/args/tool_timeout_sec` root overrides plus `tools.image_generate.approval_mode="approve"`, without which `--ask-for-approval never` refuses every MCP call. Nothing is written to `~/.claude`, `~/.codex`, or the project; the user's own MCP servers stay configured (no `--strict-mcp-config`).
@@ -27,6 +31,8 @@ senate __image-tool --socket /tmp/pcimg-<run-id>.sock
 `__image-tool` is launched by the native CLI, not by people; run it by hand only to debug the shim.
 
 ## Where it lives
+- `src/image/png.rs` — bounded PNG chunk/header validation.
+- `src/exec.rs` — process-group termination and importer credential filtering.
 - `src/image/mod.rs` — `ImageGenerator` trait, `ImageRequest`, `GeneratedImage`, `ImageBackendError`; boundary diagram.
 - `src/image/codex.rs` — `CodexImageGenerator`: `codex exec --json` driving the built-in `image_gen` tool; `thread_from_events`, `collect_output`; `backend_available` for doctor and run creation.
 - `src/image/fake.rs` — `FakeImageGenerator`: deterministic PNG per prompt, request log, scripted failures.

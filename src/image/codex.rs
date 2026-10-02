@@ -114,30 +114,43 @@ impl CodexImageGenerator {
     }
 
     fn run(&self, instruction: &str) -> Result<CodexOutput, ImageBackendError> {
+        self.run_with_timeout(instruction, TIMEOUT)
+    }
+
+    fn run_with_timeout(
+        &self,
+        instruction: &str,
+        timeout: Duration,
+    ) -> Result<CodexOutput, ImageBackendError> {
         let scratch = tempfile::tempdir()
             .map_err(|error| ImageBackendError::Network(format!("scratch dir: {error}")))?;
         // Tests exec a freshly written stub `codex` script immediately, which
         // can race another test thread's fork still holding its write fd
         // open (`ETXTBSY`); retry_busy clears that window without hiding a
         // real failure.
-        let mut child = crate::exec::retry_busy(|| {
-            Command::new(&self.executable)
-                // Sandbox and approval are root options; the working directory
-                // and the git check belong to `exec` (`codex exec --help`).
-                .args(["--sandbox", "read-only", "--ask-for-approval", "never"])
-                .args(["exec", "--skip-git-repo-check", "-C"])
-                .arg(scratch.path())
-                .args(["--json", "--color", "never", "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        })
-        .map_err(|error| ImageBackendError::Network(format!("codex launch: {error}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(instruction.as_bytes())
-                .map_err(|error| ImageBackendError::Network(format!("codex stdin: {error}")))?;
+        let mut command = crate::exec::without_jira_credentials(Command::new(&self.executable));
+        command
+            // Sandbox and approval are root options; the working directory
+            // and the git check belong to `exec` (`codex exec --help`).
+            .args(["--sandbox", "read-only", "--ask-for-approval", "never"])
+            .args(["exec", "--skip-git-repo-check", "-C"])
+            .arg(scratch.path())
+            .args(["--json", "--color", "never", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let mut child = crate::exec::retry_busy(|| command.spawn())
+            .map_err(|error| ImageBackendError::Network(format!("codex launch: {error}")))?;
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(error) = stdin.write_all(instruction.as_bytes())
+        {
+            crate::exec::kill_process_tree(&mut child);
+            return Err(ImageBackendError::Network(format!("codex stdin: {error}")));
         }
         let mut stdout = child
             .stdout
@@ -164,17 +177,21 @@ impl CodexImageGenerator {
         let started = Instant::now();
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if started.elapsed() > TIMEOUT => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                Ok(Some(_)) if reader.is_finished() && errors.is_finished() => break,
+                Ok(_) if started.elapsed() >= timeout => {
+                    crate::exec::kill_process_tree(&mut child);
+                    let _ = reader.join();
+                    let _ = errors.join();
                     return Err(ImageBackendError::Network(format!(
                         "codex image generation exceeded {} seconds",
-                        TIMEOUT.as_secs()
+                        timeout.as_secs()
                     )));
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Ok(_) => std::thread::sleep(Duration::from_millis(200)),
                 Err(error) => {
+                    crate::exec::kill_process_tree(&mut child);
+                    let _ = reader.join();
+                    let _ = errors.join();
                     return Err(ImageBackendError::Network(format!("codex wait: {error}")));
                 }
             }
@@ -469,5 +486,22 @@ mod tests {
                 .unwrap_err(),
             ImageBackendError::Rejected("quota".to_owned())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_descendant_cannot_hold_output_past_the_generation_timeout() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("background-codex");
+        std::fs::write(&script, "#!/bin/sh\ncat > /dev/null\nsleep 6 &\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let generator = CodexImageGenerator::new(script, home.path().to_path_buf());
+        let started = Instant::now();
+        assert!(matches!(
+            generator.run_with_timeout("generate", Duration::from_secs(1)),
+            Err(ImageBackendError::Network(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 }

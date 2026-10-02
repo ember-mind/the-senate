@@ -31,7 +31,7 @@ impl ClaudeInstallation {
     pub fn discover() -> Result<Self, ClaudeProviderError> {
         let executable = find_on_path("claude").ok_or(ClaudeProviderError::NotFound)?;
         let version = command_text(&executable, &["--version"], "version check")?;
-        let auth = Command::new(&executable)
+        let auth = crate::exec::without_jira_credentials(Command::new(&executable))
             .args(["auth", "status", "--json"])
             .output()
             .map_err(ClaudeProviderError::Io)?;
@@ -83,7 +83,9 @@ fn command_text(
     args: &[&str],
     operation: &'static str,
 ) -> Result<String, ClaudeProviderError> {
-    let output = Command::new(executable).args(args).output()?;
+    let output = crate::exec::without_jira_credentials(Command::new(executable))
+        .args(args)
+        .output()?;
     if !output.status.success() {
         return Err(ClaudeProviderError::Command {
             operation,

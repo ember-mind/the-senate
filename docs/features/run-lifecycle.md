@@ -4,6 +4,7 @@ Start one task as a run, watch it move through its stages, and get it moving aga
 
 ## Sub-features
 - start: `fast`/`standard`/`deep`/`review` create a run, prepare its workspace, and drive it to the first quiescent state.
+- jira-input: `--jira <key-or-browse-url>` replaces task text with a fetched immutable issue snapshot on every workflow; see [jira.md](jira.md).
 - start-preconditions: a dirty source repository is refused; so is a task naming a pull request `gh` cannot read. Both run before anything durable exists.
 - statuses: Created -> Preparing -> Ready -> Running -> {NeedsUser, Paused, Interrupted, Completed, Failed} -> {Applied, Discarded}. In Standard/Deep a failed verify stage still yields `Completed` (its edge into the decision is optional) and apply is gated separately; in Fast it is a leaf and the run is `Failed`. See verification.md.
 - ready-boundary: `Ready` is a persisted atomic boundary; configuration and workspace succeeded but nothing executed yet.

@@ -87,10 +87,33 @@ impl MissionService {
         goal: impl Into<String>,
         repository_path: impl AsRef<Path>,
     ) -> Result<MissionDetails, AppError> {
+        self.create_mission_with_packages(title, goal, repository_path, Vec::new())
+    }
+
+    /// Creates a mission and its initial packages in one atomic store commit.
+    ///
+    /// # Errors
+    /// Returns repository, contract, dependency, or persistence errors. Invalid
+    /// packages leave no mission behind.
+    pub fn create_mission_with_packages(
+        &self,
+        title: impl Into<String>,
+        goal: impl Into<String>,
+        repository_path: impl AsRef<Path>,
+        packages: Vec<NewWorkPackage>,
+    ) -> Result<MissionDetails, AppError> {
         let repository = GitRepository::discover(repository_path)?;
         let now = now();
         let id = MissionId::new();
-        let mission = Mission::new(id, now);
+        let mut mission = Mission::new(id, now);
+        let mut events = mission.created_events();
+        for package in packages {
+            events.extend(
+                mission
+                    .add_package(package.id, package.contract, package.dependencies, now)?
+                    .events,
+            );
+        }
         let input = MissionInput::new(
             id,
             title,
@@ -100,7 +123,7 @@ impl MissionService {
             now,
         )?;
         let mut store = SqliteStore::open(&self.database)?;
-        let revision = store.create_mission(&mission, &input, &mission.created_events())?;
+        let revision = store.create_mission(&mission, &input, &events)?;
         mission_query::details(
             &mut store,
             &LoadedMission {
@@ -502,36 +525,44 @@ impl MissionService {
         drop(store);
 
         let bound: RefCell<Option<Result<(), AppError>>> = RefCell::new(None);
-        let report = runs.start_run_observed(
-            workflow,
-            task,
-            &repository,
-            selection,
-            effort,
-            &ImageGenerationPlan::disabled(),
-            &|progress| {
-                observe(progress.clone());
-                if let StartProgress::PreparingWorkspace(run_id) = progress
-                    && bound.borrow().is_none()
-                {
-                    let handoff = MissionHandoffRecord {
-                        run_id,
-                        ..handoff.clone()
-                    };
-                    let outcome = self
-                        .bind_run(mission_id, package_id, run_id, Some(&handoff))
-                        .map(|_| ())
-                        .and_then(|()| {
-                            if auto_approve {
-                                runs.set_run_auto_approve(run_id, true)
-                            } else {
-                                Ok(())
-                            }
-                        });
-                    *bound.borrow_mut() = Some(outcome);
-                }
-            },
-        )?;
+        let report = runs
+            .start_run_observed(
+                workflow,
+                task,
+                &repository,
+                selection,
+                effort,
+                &ImageGenerationPlan::disabled(),
+                &|progress| {
+                    observe(progress.clone());
+                    if let StartProgress::PreparingWorkspace(run_id) = progress
+                        && bound.borrow().is_none()
+                    {
+                        let handoff = MissionHandoffRecord {
+                            run_id,
+                            ..handoff.clone()
+                        };
+                        let outcome = self
+                            .bind_run(mission_id, package_id, run_id, Some(&handoff))
+                            .map(|_| ())
+                            .and_then(|()| {
+                                if auto_approve {
+                                    runs.set_run_auto_approve(run_id, true)
+                                } else {
+                                    Ok(())
+                                }
+                            });
+                        *bound.borrow_mut() = Some(outcome);
+                    }
+                },
+            )
+            .map_err(|error| match error {
+                AppError::DirtySourceRepository => AppError::MissionIntegrationNeedsCommit {
+                    mission_id,
+                    package_id: package_id.clone(),
+                },
+                error => error,
+            })?;
         match bound.into_inner() {
             Some(Ok(())) => {}
             Some(Err(error)) => {
@@ -1086,6 +1117,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn initial_packages_are_atomic_and_restart_safe() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        // A later invalid package must not persist the earlier valid one,
+        // or even create the store.
+        assert!(
+            missions
+                .create_mission_with_packages(
+                    "Imported",
+                    "goal",
+                    &fixture.repo,
+                    vec![
+                        package("APP-1", "First", &[]),
+                        package("APP-1", "Duplicate", &[])
+                    ]
+                )
+                .is_err()
+        );
+        assert!(!fixture.database.exists());
+        let imported = missions
+            .create_mission_with_packages(
+                "Imported",
+                "goal",
+                &fixture.repo,
+                vec![
+                    package("APP-1", "First", &[]),
+                    package("APP-2", "Second", &["APP-1"]),
+                ],
+            )
+            .unwrap();
+        let reopened = fixture.missions().inspect_mission(imported.id).unwrap();
+        assert_eq!(reopened.packages.len(), 2);
+        assert_eq!(
+            reopened
+                .package(&WorkPackageId::new("APP-1").unwrap())
+                .unwrap()
+                .status,
+            WorkPackageStatus::Ready
+        );
+        assert_eq!(
+            reopened
+                .package(&WorkPackageId::new("APP-2").unwrap())
+                .unwrap()
+                .status,
+            WorkPackageStatus::Planned
+        );
+        assert_eq!(missions.list_missions().unwrap().len(), 1);
+    }
+
     /// A start carrying the mission's auto-approve arms the run in the step
     /// that binds it, so the flag is on the run before its first stage.
     #[test]
@@ -1331,6 +1412,111 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
             "changed by the package\n"
+        );
+    }
+
+    #[test]
+    fn dependent_package_requires_committing_integrated_changes_first() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        let runs = fixture.runs();
+        let mission = missions
+            .create_mission("JEV", "goal", &fixture.repo)
+            .unwrap();
+        let persistence = WorkPackageId::new("persistence").unwrap();
+        let memory = WorkPackageId::new("memory").unwrap();
+        missions
+            .add_package(mission.id, package("persistence", "Persistence", &[]))
+            .unwrap();
+        missions
+            .add_package(mission.id, package("memory", "Memory", &["persistence"]))
+            .unwrap();
+
+        let (report, _) = missions
+            .start_package(
+                &runs,
+                mission.id,
+                &persistence,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        let worktree = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_workspace(report.details.id)
+            .unwrap()
+            .unwrap()
+            .worktree_path()
+            .to_path_buf();
+        std::fs::write(worktree.join("README.md"), "persistence is integrated\n").unwrap();
+        missions
+            .integrate_package(&runs, mission.id, &persistence)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
+            "persistence is integrated\n"
+        );
+        // Applying leaves the source change unstaged and uncommitted.
+        git(&fixture.repo, &["diff", "--cached", "--quiet"]);
+
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        let run_count_before_refusal = store.list_runs().unwrap().len();
+        drop(store);
+        let error = missions
+            .start_package(
+                &runs,
+                mission.id,
+                &memory,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AppError::MissionIntegrationNeedsCommit {
+                    mission_id: error_mission,
+                    package_id
+                } if *error_mission == mission.id && package_id == &memory
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Commit changes from integrated packages")
+        );
+
+        let details = missions.inspect_mission(mission.id).unwrap();
+        let package = details.package(&memory).unwrap();
+        assert_eq!(package.status, WorkPackageStatus::Ready);
+        assert_eq!(package.current_run, None);
+        let store = SqliteStore::open(&fixture.database).unwrap();
+        assert_eq!(store.list_runs().unwrap().len(), run_count_before_refusal);
+        drop(store);
+
+        git(&fixture.repo, &["add", "README.md"]);
+        git(
+            &fixture.repo,
+            &["commit", "-qm", "integrate persistence package"],
+        );
+        let (dependent_report, _) = missions
+            .start_package(
+                &runs,
+                mission.id,
+                &memory,
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        let dependent_workspace = SqliteStore::open(&fixture.database)
+            .unwrap()
+            .load_workspace(dependent_report.details.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dependent_workspace.worktree_path().join("README.md")).unwrap(),
+            "persistence is integrated\n"
         );
     }
 

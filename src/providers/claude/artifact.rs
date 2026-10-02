@@ -24,11 +24,11 @@ pub(crate) fn persist(
     now: DateTime<Utc>,
 ) -> Result<ArtifactRecord, ClaudeProviderError> {
     let mut bytes = content.as_bytes().to_vec();
-    if bytes.len() > MAX_ARTIFACT_BYTES {
-        return Err(ClaudeProviderError::ArtifactTooLarge(MAX_ARTIFACT_BYTES));
-    }
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
+    }
+    if bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(ClaudeProviderError::ArtifactTooLarge(MAX_ARTIFACT_BYTES));
     }
     let directory = root.join(request.run_id().to_string()).join("artifacts");
     std::fs::create_dir_all(&directory)?;
@@ -114,5 +114,57 @@ const fn kind(stage: StageKind) -> ArtifactKind {
         StageKind::FollowUp => ArtifactKind::FollowUp,
         StageKind::Lead => ArtifactKind::Lead,
         StageKind::Verify => ArtifactKind::Verify,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Role, RunId, StageId, StageStatus};
+
+    #[test]
+    fn artifact_ceiling_includes_the_newline_added_by_persistence() {
+        let root = tempfile::tempdir().unwrap();
+        let request = ProviderRequest::new(
+            RunId::new(),
+            StageId::new("implementation").unwrap(),
+            StageKind::Implementation,
+            StageStatus::Running,
+            Role::Implementer,
+            "task".to_owned(),
+            root.path().to_path_buf(),
+            1,
+            0,
+            None,
+            vec![],
+        );
+        let provider = ProviderId::new("claude").unwrap();
+        let now = std::time::SystemTime::now().into();
+        let content = "x".repeat(MAX_ARTIFACT_BYTES);
+        assert!(matches!(
+            persist(
+                root.path(),
+                &request,
+                &provider,
+                None,
+                "base",
+                &content,
+                now
+            ),
+            Err(ClaudeProviderError::ArtifactTooLarge(_))
+        ));
+        assert!(!root.path().join(request.run_id().to_string()).exists());
+        let at_limit = format!("{}\n", "x".repeat(MAX_ARTIFACT_BYTES - 1));
+        let artifact = persist(
+            root.path(),
+            &request,
+            &provider,
+            None,
+            "base",
+            &at_limit,
+            now,
+        )
+        .unwrap();
+        assert_eq!(artifact.content_size(), MAX_ARTIFACT_BYTES as u64);
     }
 }

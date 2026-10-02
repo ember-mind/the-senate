@@ -30,6 +30,8 @@ const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Largest checksum manifest The Senate will read.
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
+/// Reporting a version must not require interactive work or a long session.
+pub(super) const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -249,11 +251,7 @@ pub fn install_with_receipt_path(
 
     // Staging next to the target keeps the final rename on one filesystem,
     // which is what makes it atomic.
-    let staged = staging_path(executable);
-    if let Some(parent) = staged.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| InstallError::Staging(error.to_string()))?;
-    }
+    let staged = staging_path(executable)?;
     let result = stage_and_verify(asset, &staged, downloader, &expected, &release.version);
     if let Err(error) = result {
         discard(&staged);
@@ -315,12 +313,22 @@ fn stage_and_verify(
 
 /// The staging file lives beside the target and is named so an interrupted
 /// run leaves something obviously temporary rather than a plausible binary.
-fn staging_path(executable: &Path) -> PathBuf {
+fn staging_path(executable: &Path) -> Result<tempfile::TempPath, InstallError> {
     let name = executable.file_name().map_or_else(
         || "senate".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
-    executable.with_file_name(format!(".{name}.update"))
+    let parent = executable
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| InstallError::Staging(error.to_string()))?;
+    tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".update")
+        .tempfile_in(parent)
+        .map(tempfile::NamedTempFile::into_temp_path)
+        .map_err(|error| InstallError::Staging(error.to_string()))
 }
 
 #[cfg(unix)]
@@ -343,14 +351,8 @@ fn make_executable(_path: &Path) -> Result<(), InstallError> {
 /// a mislabelled or mismatched asset cannot be installed. The checksum has
 /// already matched the release's own manifest at this point.
 fn verify_reported_version(staged: &Path, expected: &Version) -> Result<(), InstallError> {
-    // Tests stage the freshly written binary and run it immediately, which
-    // can race another test thread's fork still holding its write fd open
-    // (`ETXTBSY`); retry_busy clears that window without hiding a real
-    // failure.
-    let output =
-        crate::exec::retry_busy(|| std::process::Command::new(staged).arg("--version").output())
-            .map_err(|error| InstallError::Staging(error.to_string()))?;
-    let reported = String::from_utf8_lossy(&output.stdout);
+    let output = probe_version(staged, VERSION_PROBE_TIMEOUT).map_err(InstallError::Staging)?;
+    let reported = String::from_utf8_lossy(&output);
     let computed = reported
         .split_whitespace()
         .find_map(|word| Version::parse(word.trim_start_matches('v')).ok())
@@ -366,6 +368,33 @@ fn verify_reported_version(staged: &Path, expected: &Version) -> Result<(), Inst
             computed: computed.to_string(),
         })
     }
+}
+
+/// Shared by self-update and bootstrap registration. Supervision preserves
+/// native path bytes, caps both streams and covers inherited output pipes.
+pub(super) fn probe_version(
+    executable: &Path,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    // The API receives a file path, including relative/non-UTF-8 paths;
+    // never let a bare filename turn into a PATH search for another binary.
+    let executable = executable
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let report = crate::providers::verify::runner::run_argv(
+        "binary --version",
+        &executable,
+        &["--version"],
+        Path::new("."),
+        timeout,
+    );
+    if !report.exit.succeeded() {
+        return Err(format!("binary --version failed: {:?}", report.exit));
+    }
+    if report.stdout.dropped > 0 || report.stderr.dropped > 0 {
+        return Err("binary --version output exceeds 64 KiB per stream".to_owned());
+    }
+    Ok(report.stdout.bytes)
 }
 
 /// The real downloader: HTTPS with a bounded body and a plain timeout.
@@ -608,6 +637,60 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *senate-aarch64
                 .all(|entry| entry.unwrap().file_name() != ".senate.update"),
             "no staging file survives a successful install"
         );
+    }
+
+    #[test]
+    fn a_matching_version_from_a_failed_binary_never_replaces_the_installation() {
+        let fixture = TempDir::new().unwrap();
+        let executable = existing(&fixture);
+        let original = std::fs::read(&executable).unwrap();
+        let (release, mut downloader, _) = healthy("0.2.0");
+        let name = target_asset_name().unwrap();
+        let broken = b"#!/bin/sh\necho senate 0.2.0\nexit 42\n";
+        downloader
+            .assets
+            .insert(format!("https://example.invalid/{name}"), broken.to_vec());
+        downloader.assets.insert(
+            format!("https://example.invalid/{CHECKSUM_ASSET}"),
+            format!("{}  {name}\n", hex(broken)).into_bytes(),
+        );
+        assert!(matches!(
+            install_with_receipt_path(
+                &release,
+                &executable,
+                &fixture.receipt(),
+                &downloader,
+                now()
+            ),
+            Err(InstallError::Staging(_))
+        ));
+        assert_eq!(std::fs::read(executable).unwrap(), original);
+        assert!(!fixture.receipt().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probes_bound_stalled_descendants_and_refuse_excess_output() {
+        let fixture = TempDir::new().unwrap();
+        let executable = fixture.path().join("candidate");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\necho senate 0.2.0\nsleep 6 & exit 0\n",
+        )
+        .unwrap();
+        make_executable(&executable).unwrap();
+        let started = std::time::Instant::now();
+        let error = probe_version(&executable, std::time::Duration::from_millis(100)).unwrap_err();
+        assert!(error.contains("TimedOut"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nhead -c 70000 /dev/zero\necho senate 0.2.0\n",
+        )
+        .unwrap();
+        let error = probe_version(&executable, VERSION_PROBE_TIMEOUT).unwrap_err();
+        assert!(error.contains("64 KiB"), "{error}");
     }
 
     /// The field failure this seam exists to prevent: an installer unit test
@@ -934,12 +1017,20 @@ bb11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233 *senate-aarch64
 
     #[test]
     fn staging_stays_beside_the_target_so_the_swap_is_atomic() {
-        let staged = staging_path(Path::new("/usr/local/bin/senate"));
-        assert_eq!(staged.parent(), Some(Path::new("/usr/local/bin")));
-        assert_eq!(
-            staged.file_name().unwrap(),
-            ".senate.update",
-            "an interrupted run leaves something obviously temporary"
+        let fixture = TempDir::new().unwrap();
+        let target = fixture.path().join("senate");
+        let staged = staging_path(&target).unwrap();
+        let second = staging_path(&target).unwrap();
+        assert_eq!(staged.parent(), Some(fixture.path()));
+        assert_ne!(
+            &*staged, &*second,
+            "concurrent updates must not share staging bytes"
         );
+        let name = staged.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(".senate.") && name.ends_with(".update"));
+        let stale = fixture.path().join(".senate.update");
+        std::fs::write(&stale, b"unrelated").unwrap();
+        assert_ne!(&*staged, stale.as_path());
+        assert_eq!(std::fs::read(stale).unwrap(), b"unrelated");
     }
 }

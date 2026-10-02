@@ -3,6 +3,7 @@
 Choose how much process a task gets: one implementation stage, a full architecture-to-decision pipeline, or a read-only review, and then extend a finished run with fix or continue cycles.
 
 ## Sub-features
+- stage-identifiers: a Stage ID is one filename component; `.`/`..`, either slash and control characters are refused at construction and deserialization. Other string identifiers reject controls while preserving vendor/model slashes.
 - fast: Implementation -> Verify.
 - standard: Architecture -> Implementation -> Simplification -> Code Quality Review + Specification Review + Verify -> Decision.
 - deep: Research before Architecture, then the Standard graph.
@@ -30,6 +31,7 @@ senate fix <run-id>
 TUI run detail: `f` next cycle — on a finished run a picker of Fix / Continue / Follow-ups (↑/↓ + Enter, or the cycle's own key; Follow-ups only when the decision wrote that section; skipped when only one applies), on a working run books a fix (press again to cancel the booking); `c` continue with a typed instruction (Enter submits, Esc cancels), `w` work on the decision's Follow-ups (↑/↓ toggles "in this run" / "as a new run", Enter confirms).
 
 ## Where it lives
+- `src/domain/ids.rs` — validated string identifiers and Stage ID filename constraints.
 - `src/domain/workflow.rs` — `WorkflowKind`, `StageKind` (incl. `Fix`, `FollowUp`, `Verify`), built-in DAGs, `fix_cycle_stages`, `continue_cycle_stages`, `next_follow_up_stage_id`, `requires_writable_workspace`, `without_verification`.
 - `src/domain/role.rs` — roles (Researcher, Architect, Implementer, Simplifier, CodeQualityReviewer, SpecReviewer, EngineeringLead, Verifier, legacy Reviewer).
 - `src/engine/scheduler.rs` — graph-driven advancement; one eligible stage at a time.
@@ -45,7 +47,7 @@ TUI run detail: `f` next cycle — on a finished run a picker of Fix / Continue 
 - There is no `continue` CLI command; continue and follow-ups are TUI-only (`c`, `w`).
 - Fix and continue require `RunStatus::Completed` and a Decision stage in the graph; `fast` runs have no decision, so `f`/`c`/`w` are refused with an explanation.
 - Fix cycles never re-run the reviews; start a `review` run over the result if you want them back. They do re-run verification (`verify_<n>`), and the fresh decision only optionally depends on it.
-- A failed Verify stage does not fail the run: the decision runs with the failure in evidence, the run completes, and `fix`/continue stay available. Only `apply` is refused until the latest verification passes; `pr` publishes regardless.
+- In Standard/Deep a failed Verify stage does not fail the run: the decision runs with the failure in evidence, the run completes, and `fix`/continue stay available. In Fast it fails the run and can be retried. Only `apply` is refused until the latest verification passes; `pr` publishes regardless.
 - A run created before fix-cycle routing existed cannot execute a fix; `request_fix` checks this before committing anything.
 - Existing persisted runs keep their original stored graph, including legacy generic Review stages; only new runs use the current definitions.
 - The change handoff is derived evidence, not an artifact; oversized diffs are marked INCOMPLETE, never silently cut. Resume prompts do not re-inject it.

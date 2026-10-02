@@ -143,7 +143,7 @@ impl GhClient {
         // (`ETXTBSY`); retry_busy clears that window without hiding a real
         // failure.
         let output = crate::exec::retry_busy(|| {
-            Command::new(&self.executable)
+            crate::exec::without_jira_credentials(Command::new(&self.executable))
                 .current_dir(cwd)
                 .args(args)
                 .stdin(Stdio::null())
@@ -324,7 +324,7 @@ impl GhClient {
             number,
         } = pull_request;
         let output = crate::exec::retry_busy(|| {
-            Command::new(&self.executable)
+            crate::exec::without_jira_credentials(Command::new(&self.executable))
                 .args([
                     OsString::from("api"),
                     OsString::from(format!("repos/{owner}/{repository}/pulls/{number}")),
@@ -362,7 +362,7 @@ impl GhClient {
         // See the comment in `run`: a stub `gh` can still be draining an
         // inherited write fd from another test's fork when this execs it.
         let output = crate::exec::retry_busy(|| {
-            Command::new(&self.executable)
+            crate::exec::without_jira_credentials(Command::new(&self.executable))
                 .args([
                     OsString::from("api"),
                     OsString::from(format!("repos/{owner}/{repository}/pulls/{number}")),

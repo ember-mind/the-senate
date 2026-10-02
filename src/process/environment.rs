@@ -65,14 +65,15 @@ pub(crate) fn encode_forwarded_environment() -> Result<Option<Vec<u8>>, ProcessE
 }
 
 pub(crate) fn internal_environment_name(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            "SENATE_MANAGED_PROCESS_ID"
-                | "SENATE_COMMAND_FINGERPRINT"
-                | "SENATE_ENVIRONMENT_SOCKET"
+    crate::exec::jira_environment_name(name)
+        || matches!(
+            name.to_str(),
+            Some(
+                "SENATE_MANAGED_PROCESS_ID"
+                    | "SENATE_COMMAND_FINGERPRINT"
+                    | "SENATE_ENVIRONMENT_SOCKET"
+            )
         )
-    )
 }
 
 #[cfg(unix)]
@@ -180,6 +181,18 @@ fn read_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jira_configuration_never_crosses_environment_handoff() {
+        assert!(internal_environment_name(OsStr::new("SENATE_JIRA_TOKEN")));
+        assert!(internal_environment_name(OsStr::new("SENATE_JIRA_URL")));
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC);
+        push_u32(&mut encoded, 1).unwrap();
+        push_bytes(&mut encoded, b"SENATE_JIRA_TOKEN").unwrap();
+        push_bytes(&mut encoded, b"secret").unwrap();
+        assert!(decode_forwarded_environment(&encoded).is_err());
+    }
 
     #[test]
     fn codec_round_trips_non_secret_safe_shape() {

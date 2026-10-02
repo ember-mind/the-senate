@@ -1,4 +1,4 @@
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -38,13 +38,16 @@ pub(crate) fn persist(
     base_commit: &str,
     now: DateTime<Utc>,
 ) -> Result<ArtifactRecord, CodexProviderError> {
-    let mut bytes = std::fs::read(final_message_path).map_err(|error| {
+    let file = std::fs::File::open(final_message_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CodexProviderError::MissingFinalMessage(final_message_path.to_path_buf())
         } else {
             error.into()
         }
     })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ARTIFACT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     // Normalize before measuring. The appended newline is part of what gets
     // written, so checking the file's own length would let a message of
     // exactly the ceiling be persisted one byte over it.
@@ -138,5 +141,48 @@ const fn kind(stage: StageKind) -> ArtifactKind {
         StageKind::FollowUp => ArtifactKind::FollowUp,
         StageKind::Lead => ArtifactKind::Lead,
         StageKind::Verify => ArtifactKind::Verify,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Role, RunId, StageId, StageStatus};
+
+    #[test]
+    fn oversized_final_message_is_rejected_without_persisting_an_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let final_path = root.path().join("final.txt");
+        std::fs::File::create(&final_path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let request = ProviderRequest::new(
+            RunId::new(),
+            StageId::new("implementation").unwrap(),
+            StageKind::Implementation,
+            StageStatus::Running,
+            Role::Implementer,
+            "task".to_owned(),
+            root.path().to_path_buf(),
+            1,
+            0,
+            None,
+            vec![],
+        );
+        let provider = ProviderId::new("codex").unwrap();
+        assert!(matches!(
+            persist(
+                root.path(),
+                &final_path,
+                &request,
+                &provider,
+                None,
+                "base",
+                std::time::SystemTime::now().into()
+            ),
+            Err(CodexProviderError::ArtifactTooLarge(_))
+        ));
+        assert!(!root.path().join(request.run_id().to_string()).exists());
     }
 }

@@ -41,6 +41,8 @@ const MAX_CONNECTIONS: usize = 32;
 /// How long the single-instance probe waits for an existing server to
 /// answer before deciding to start a new one.
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+/// A concurrent start may own the lock before it can answer health probes.
+const INSTANCE_START_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the accept loop sleeps between polls of the shutdown flag.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -59,9 +61,38 @@ struct InstanceState {
 /// or the shutdown-signal handlers cannot be set up.
 pub fn run(args: &WorldArgs) -> anyhow::Result<()> {
     let state_path = crate::store::world_state_file()?;
+    let started = Instant::now();
+    let _instance_lock = loop {
+        match lock_instance(&state_path) {
+            Ok(lock) => break lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(existing) = existing_instance(&state_path) {
+                    let url = browser_url(
+                        existing.port,
+                        &existing.token,
+                        args.mission,
+                        args.demo.as_deref(),
+                    );
+                    announce(&url, existing.port, args.no_open);
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    started.elapsed() < INSTANCE_START_TIMEOUT,
+                    "another Senate instance holds the lock but is not responding"
+                );
+                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
 
     if let Some(existing) = existing_instance(&state_path) {
-        let url = browser_url(existing.port, &existing.token, args.demo.as_deref());
+        let url = browser_url(
+            existing.port,
+            &existing.token,
+            args.mission,
+            args.demo.as_deref(),
+        );
         announce(&url, existing.port, args.no_open);
         return Ok(());
     }
@@ -84,7 +115,7 @@ pub fn run(args: &WorldArgs) -> anyhow::Result<()> {
         return Err(error.into());
     }
 
-    let url = browser_url(port, &token, args.demo.as_deref());
+    let url = browser_url(port, &token, args.mission, args.demo.as_deref());
     announce(&url, port, args.no_open);
 
     let mission = args.mission;
@@ -148,19 +179,22 @@ impl Drop for ConnectionSlot {
 }
 
 /// A reader that refuses to read past a fixed instant.
-struct Deadline<R> {
-    inner: R,
+struct Deadline {
+    inner: TcpStream,
     until: Instant,
 }
 
-impl<R: Read> Read for Deadline<R> {
+impl Read for Deadline {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if Instant::now() >= self.until {
+        let remaining = self.until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "request took too long",
             ));
         }
+        self.inner
+            .set_read_timeout(Some(remaining.min(READ_TIMEOUT)))?;
         self.inner.read(buf)
     }
 }
@@ -191,8 +225,20 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn browser_url(port: u16, token: &str, demo: Option<&str>) -> String {
-    let query = demo.map_or_else(String::new, |scenario| format!("?demo={scenario}"));
+fn browser_url(port: u16, token: &str, mission: Option<MissionId>, demo: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(mission) = mission {
+        query.append_pair("mission", &mission.to_string());
+    }
+    if let Some(demo) = demo {
+        query.append_pair("demo", demo);
+    }
+    let query = query.finish();
+    let query = if query.is_empty() {
+        query
+    } else {
+        format!("?{query}")
+    };
     format!("http://127.0.0.1:{port}/{query}#token={token}")
 }
 
@@ -202,12 +248,34 @@ fn open_browser(url: &str) {
     } else {
         "xdg-open"
     };
-    let _ = std::process::Command::new(opener)
+    let _ = crate::exec::without_jira_credentials(std::process::Command::new(opener))
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// Keep the lock file's inode: deleting it could let two processes lock
+/// different files with the same name. Closing the descriptor releases it.
+fn lock_instance(state_path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = state_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(state_path.with_extension("lock"))?;
+    #[cfg(unix)]
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    Ok(file)
 }
 
 /// An already-running instance whose recorded port and token still answer
@@ -257,25 +325,19 @@ fn health_proof(token: &str, challenge: &str) -> String {
     hex_encode(&hasher.finalize())
 }
 
-#[cfg(unix)]
 fn write_state_file(path: &Path, state: &InstanceState) -> anyhow::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
     let bytes = serde_json::to_vec(state)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    // A private temporary file also replaces an old permissive file or a
+    // symlink, without truncating its target or exposing a partial token.
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(&bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_state_file(path: &Path, state: &InstanceState) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(state)?;
-    std::fs::write(path, bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
     Ok(())
 }
 
@@ -295,12 +357,19 @@ impl HttpRequest {
     }
 
     /// The campaign a tab asked for with `?mission=<id>`, if it names one.
-    fn mission(&self) -> Option<MissionId> {
-        let query = self.path.split_once('?')?.1.split('#').next()?;
-        query
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("mission="))
-            .and_then(|value| value.parse().ok())
+    fn mission(&self) -> Result<Option<MissionId>, ()> {
+        let Some((_, query)) = self.path.split_once('?') else {
+            return Ok(None);
+        };
+        let mut missions =
+            url::form_urlencoded::parse(query.as_bytes()).filter(|(name, _)| name == "mission");
+        let Some((_, value)) = missions.next() else {
+            return Ok(None);
+        };
+        if missions.next().is_some() {
+            return Err(());
+        }
+        value.parse().map(Some).map_err(|_| ())
     }
 
     /// The path with any query string or fragment removed.
@@ -380,6 +449,8 @@ fn handle_connection(
 }
 
 fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<HttpRequest>> {
+    let malformed =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed HTTP request");
     let too_large =
         || std::io::Error::new(std::io::ErrorKind::InvalidData, "request head too large");
     let mut head_left = MAX_HEAD_BYTES;
@@ -387,8 +458,11 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<HttpRequest
     let mut next_line = |reader: &mut dyn BufRead, line: &mut String| -> std::io::Result<usize> {
         let read = reader.take(head_left).read_line(line)?;
         head_left -= read as u64;
-        if head_left == 0 && !line.ends_with('\n') {
+        if head_left == 0 && !line.ends_with("\r\n") {
             return Err(too_large());
+        }
+        if read > 0 && !line.ends_with("\r\n") {
+            return Err(malformed());
         }
         Ok(read)
     };
@@ -397,40 +471,70 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<HttpRequest
     if next_line(reader, &mut request_line)? == 0 {
         return Ok(None);
     }
-    let mut parts = request_line.split_whitespace();
+    let mut parts = request_line.trim_end_matches("\r\n").split(' ');
     let method = parts.next().unwrap_or_default().to_owned();
     let path = parts.next().unwrap_or_default().to_owned();
-    if method.is_empty() || path.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "empty request line",
-        ));
+    if !http_token(&method)
+        || !path.starts_with('/')
+        || path.contains('#')
+        || path.bytes().any(|byte| byte <= 0x20 || byte == 0x7f)
+        || !matches!(parts.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+        || parts.next().is_some()
+    {
+        return Err(malformed());
     }
 
     let mut headers = Vec::new();
-    let mut content_length: usize = 0;
+    let mut content_length = None;
     loop {
         let mut line = String::new();
         if next_line(reader, &mut line)? == 0 {
+            return Err(malformed());
+        }
+        let line = line.strip_suffix("\r\n").ok_or_else(malformed)?;
+        if line.is_empty() {
             break;
         }
         if headers.len() >= MAX_HEADERS {
             return Err(too_large());
         }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            break;
+        let (name, value) = line.split_once(':').ok_or_else(malformed)?;
+        if !http_token(name)
+            || value
+                .bytes()
+                .any(|byte| (byte < 0x20 && byte != b'\t') || byte == 0x7f)
+        {
+            return Err(malformed());
         }
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim().to_owned();
-            let value = value.trim().to_owned();
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(malformed());
+        }
+        if [
+            "host",
+            "origin",
+            "x-senate-token",
+            "x-senate-challenge",
+            "content-length",
+        ]
+        .iter()
+        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+            && headers
+                .iter()
+                .any(|(previous, _): &(String, String)| previous.eq_ignore_ascii_case(name))
+        {
+            return Err(malformed());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(malformed());
             }
-            headers.push((name, value));
+            content_length = Some(value.parse::<usize>().map_err(|_| malformed())?);
         }
+        headers.push((name.to_owned(), value.to_owned()));
     }
 
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -448,6 +552,13 @@ fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<HttpRequest
         headers,
         body,
     }))
+}
+
+fn http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 fn route(
@@ -512,7 +623,10 @@ fn route_api(
 
     // A tab opened from the terminal names its campaign; one server serves
     // every campaign, so a second `W` never shows the wrong one.
-    let mission = request.mission().or(mission);
+    let mission = match request.mission() {
+        Ok(selected) => selected.or(mission),
+        Err(()) => return HttpResponse::error(400, "invalid or repeated mission parameter"),
+    };
     match (request.method.as_str(), api_path) {
         ("GET", "/health") => HttpResponse::json(200, &serde_json::json!({ "ok": true })),
         ("GET", "/world") => match projection::snapshot(mission) {
@@ -524,7 +638,10 @@ fn route_api(
             Err(error) => HttpResponse::error(500, &error.to_string()),
         },
         ("GET", path) if path.starts_with("/order/") => {
-            match projection::order_detail(mission, &path["/order/".len()..]) {
+            let Ok(id) = decode_path_component(&path["/order/".len()..]) else {
+                return HttpResponse::error(400, "invalid order id encoding");
+            };
+            match projection::order_detail(mission, &id) {
                 Ok(Some(detail)) => {
                     HttpResponse::json(200, &serde_json::to_value(detail).unwrap_or_default())
                 }
@@ -539,6 +656,22 @@ fn route_api(
         ("POST", "/consul") => ask(request, mission),
         _ => HttpResponse::error(404, "not found"),
     }
+}
+
+/// Path components use percent escapes, with literal `+` (unlike form queries).
+fn decode_path_component(component: &str) -> Result<String, ()> {
+    let mut decoded = Vec::with_capacity(component.len());
+    let mut bytes = component.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = char::from(bytes.next().ok_or(())?).to_digit(16).ok_or(())?;
+            let low = char::from(bytes.next().ok_or(())?).to_digit(16).ok_or(())?;
+            decoded.push(u8::try_from(high * 16 + low).map_err(|_| ())?);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| ())
 }
 
 fn ask(request: &HttpRequest, mission: Option<MissionId>) -> HttpResponse {
@@ -617,6 +750,7 @@ fn token_matches(candidate: &str, expected: &str) -> bool {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -683,13 +817,135 @@ mod tests {
     #[test]
     fn browser_url_puts_the_token_in_the_fragment_and_demo_before_it() {
         assert_eq!(
-            browser_url(4123, "deadbeef", None),
+            browser_url(4123, "deadbeef", None, None),
             "http://127.0.0.1:4123/#token=deadbeef"
         );
         assert_eq!(
-            browser_url(4123, "deadbeef", Some("review")),
+            browser_url(4123, "deadbeef", None, Some("review")),
             "http://127.0.0.1:4123/?demo=review#token=deadbeef"
         );
+    }
+
+    #[test]
+    fn browser_url_preserves_the_selected_mission_and_encodes_demo_values() {
+        let mission = MissionId::from_u128(42);
+        let url = browser_url(
+            4123,
+            "deadbeef",
+            Some(mission),
+            Some("review&mission=wrong#fragment"),
+        );
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.fragment(), Some("token=deadbeef"));
+        let pairs = parsed.query_pairs().collect::<Vec<_>>();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "mission");
+        assert_eq!(pairs[0].1, mission.to_string());
+        assert_eq!(pairs[1].1, "review&mission=wrong#fragment");
+    }
+
+    #[test]
+    fn invalid_mission_query_never_falls_back_to_another_campaign() {
+        let mission = MissionId::from_u128(42);
+        for query in [
+            "mission=wrong".to_owned(),
+            format!("mission={mission}&mission={mission}"),
+        ] {
+            let mut reader = std::io::Cursor::new(format!(
+                "GET /api/world?{query} HTTP/1.1\r\nHost: 127.0.0.1:4123\r\nX-Senate-Token: test\r\n\r\n"
+            ));
+            let request = read_request(&mut reader).unwrap().unwrap();
+            assert_eq!(route(&request, 4123, "test", Some(mission)).status, 400);
+        }
+    }
+
+    #[test]
+    fn state_file_creates_its_directory_and_replaces_an_old_file_privately() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new-data/world.json");
+        let state = InstanceState {
+            pid: 1,
+            port: 4123,
+            token: "test-token".to_owned(),
+        };
+        write_state_file(&path, &state).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            write_state_file(&path, &state).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let target = directory.path().join("untouched");
+            std::fs::write(&target, b"original").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            write_state_file(&path, &state).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+            assert!(
+                !std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        let saved: InstanceState = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.token, state.token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_refuses_a_second_start_and_is_released_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new-data/world.json");
+        let first = lock_instance(&path).unwrap();
+        assert_eq!(
+            lock_instance(&path).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        let _next = lock_instance(&path).unwrap();
+        assert!(path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_http_heads_are_refused() {
+        for request in [
+            "GET /\r\n\r\n",
+            "GET / HTTP/1.1 extra\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost:4123\r\n",
+            "GET / HTTP/1.1\r\nBroken header\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost : localhost:4123\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: localhost:4123\r\nHost: evil\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: invalid\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: +1\r\n\r\nx",
+            "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nx",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "GET / HTTP/1.1\r\nX-Bad: text\0hidden\r\n\r\n",
+            "GET / HTTP/1.1\nHost: localhost:4123\n\n",
+        ] {
+            assert!(
+                read_request(&mut std::io::Cursor::new(request)).is_err(),
+                "accepted {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_limit_is_inclusive_and_body_bytes_are_preserved() {
+        let mut request = String::from("POST /api/consul HTTP/1.1\r\nContent-Length: 3\r\n");
+        for i in 1..MAX_HEADERS {
+            let _ = write!(request, "X-{i}: 1\r\n");
+        }
+        request.push_str("\r\nabc");
+        let parsed = read_request(&mut std::io::Cursor::new(request))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.headers.len(), MAX_HEADERS);
+        assert_eq!(parsed.body, b"abc");
+        assert_eq!(reason_phrase(202), "Accepted");
     }
 
     fn get(
@@ -853,13 +1109,48 @@ mod tests {
 
     #[test]
     fn a_reader_past_its_deadline_stops_reading() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let mut late = Deadline {
-            inner: std::io::Cursor::new(b"GET / HTTP/1.1\r\n".to_vec()),
+            inner: listener.accept().unwrap().0,
             until: Instant::now(),
         };
         let mut buf = [0_u8; 8];
         let error = late.read(&mut buf).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_blocking_read_cannot_exceed_the_whole_request_budget() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let started = Instant::now();
+        let mut reader = Deadline {
+            inner: listener.accept().unwrap().0,
+            until: started + Duration::from_millis(30),
+        };
+        let error = reader.read(&mut [0_u8; 8]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn order_ids_decode_percent_escapes_without_changing_literal_plus() {
+        assert_eq!(
+            decode_path_component("build%2F%C3%A8+%25").unwrap(),
+            "build/è+%"
+        );
+        for invalid in ["%", "%0", "%XX", "%FF"] {
+            assert!(decode_path_component(invalid).is_err());
+            let mut reader = std::io::Cursor::new(format!(
+                "GET /api/order/{invalid} HTTP/1.1\r\nHost: 127.0.0.1:4123\r\nX-Senate-Token: test\r\n\r\n"
+            ));
+            let request = read_request(&mut reader).unwrap().unwrap();
+            assert_eq!(route(&request, 4123, "test", None).status, 400);
+        }
     }
 
     #[test]

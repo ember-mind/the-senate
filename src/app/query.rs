@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -953,7 +954,14 @@ pub(crate) fn read_artifact(
             run_id,
             stage_id: stage_id.clone(),
         })?;
-    let bytes = std::fs::read(artifact.path()).map_err(StoreError::Io)?;
+    let file = std::fs::File::open(artifact.path()).map_err(StoreError::Io)?;
+    if file.metadata().map_err(StoreError::Io)?.len() != artifact.content_size() {
+        return Err(StoreError::ArtifactIntegrity(artifact.path().to_path_buf()).into());
+    }
+    let mut bytes = Vec::new();
+    file.take(artifact.content_size().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(StoreError::Io)?;
     let size_matches = u64::try_from(bytes.len()) == Ok(artifact.content_size());
     let mut hash = String::with_capacity(64);
     for byte in Sha256::digest(&bytes) {

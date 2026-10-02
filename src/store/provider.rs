@@ -1,3 +1,4 @@
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -490,9 +491,23 @@ pub(crate) fn insert_artifact_row(
 }
 
 pub(crate) fn verify_artifact(artifact: &ArtifactRecord) -> Result<(), StoreError> {
-    let bytes = std::fs::read(artifact.path())?;
-    let size = u64::try_from(bytes.len()).map_err(|_| StoreError::IntegerRange("artifact size"))?;
-    let digest = Sha256::digest(&bytes);
+    let file = std::fs::File::open(artifact.path())?;
+    if file.metadata()?.len() != artifact.content_size() {
+        return Err(StoreError::ArtifactIntegrity(artifact.path().to_path_buf()));
+    }
+    let mut reader = file.take(artifact.content_size().saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 16 * 1024];
+    let mut size = 0;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
     let mut hash = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write as _;

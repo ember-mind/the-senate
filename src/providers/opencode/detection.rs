@@ -211,7 +211,7 @@ fn command_output(executable: &Path, args: &[&str]) -> std::io::Result<Output> {
     std::fs::write(&config_path, config.to_string())?;
     let environment = command::environment(&config_path, &config["permission"]);
     crate::exec::retry_busy(|| {
-        Command::new(executable)
+        crate::exec::without_jira_credentials(Command::new(executable))
             .args(args)
             .arg("--pure")
             .envs(&environment)

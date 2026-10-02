@@ -3,6 +3,8 @@
 Measure one provider/model candidate on one engineering role against source-controlled cases with deterministic oracles, without touching production runs or routing.
 
 ## Sub-features
+- validation-bounds: trusted validation preserves the case's exact argv, uses a 1800 s limit per command including output draining, and records bounded 64 KiB tails per stream with omitted-byte counts in `validation.txt`. Timeout is benchmark failure; failure to start or inspect the command is infrastructure failure.
+- fixture-git: fixture initialization uses the isolated Git command boundary, excluding ambient Git redirection and Jira importer credentials. The fixture commit disables hooks and GPG signing so global configuration cannot trigger hooks or an interactive signing prompt.
 - list: prints each suite version, its fingerprint and cases (`role=`, `workflow=`).
 - run: materializes a fresh fixture repository per repetition, drives the normal engine with an `eval_v1` routing plan (candidate on the target role, Fake on every other role), scores, and writes evidence.
 - report: aggregates one or more result files/directories by suite version and target; never picks a winner.
@@ -26,6 +28,7 @@ senate eval report <codex-results> <claude-results>
 Flags on `eval run`: `--suite <version>` (default `role_core_v1`), `--provider claude|codex|fake` (required), `--model <id>`, `--effort native|low|medium|high|xhigh` (default native; recorded as `requested_effort` on every result), `--repeat <n>` (default 1), `--allow-native-usage`, `--out <path>`.
 
 ## Where it lives
+- `src/providers/verify/runner.rs`, `src/git/command.rs` — bounded command execution and isolated fixture Git.
 - `src/cli/mod.rs` — `EvalCommand`, `EvalRunArgs`.
 - `src/cli/commands.rs` — `eval`, `run_eval` (per-case progress lines and ✓/✗/! marks).
 - `src/eval/case.rs` — cases and ground truth; fixture files embedded with `include_str!` from `evals/`.

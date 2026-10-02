@@ -18,7 +18,7 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
     };
     let mut last = String::from("no browser opener found");
     for program in candidates {
-        match Command::new(program)
+        match crate::exec::without_jira_credentials(Command::new(program))
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -43,7 +43,7 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
 pub(crate) fn enter_senate(mission: Option<crate::domain::MissionId>) -> Result<(), String> {
     use std::os::unix::process::CommandExt as _;
     let exe = std::env::current_exe().map_err(|source| format!("senate: {source}"))?;
-    let mut command = Command::new(exe);
+    let mut command = crate::exec::without_jira_credentials(Command::new(exe));
     command.arg("world");
     if let Some(mission) = mission {
         command.arg("--mission").arg(mission.to_string());
@@ -76,7 +76,7 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     };
     let mut last = String::from("no clipboard tool found");
     for (program, args) in candidates {
-        let child = Command::new(program)
+        let child = crate::exec::without_jira_credentials(Command::new(program))
             .args(*args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -93,6 +93,8 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
             && let Err(source) = stdin.write_all(text.as_bytes())
         {
             last = format!("{program}: {source}");
+            let _ = child.kill();
+            let _ = child.wait();
             continue;
         }
         match child.wait() {

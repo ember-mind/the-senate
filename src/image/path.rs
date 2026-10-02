@@ -137,6 +137,9 @@ impl ValidatedOutput {
     /// Returns the I/O failure; `AlreadyExists` when the destination raced
     /// into existence; `OutsideWorktree` if a parent now escapes.
     pub(crate) fn write_no_overwrite(&self, bytes: &[u8]) -> Result<PathBuf, OutputPathError> {
+        // Recheck before creating directories too: generation may have taken
+        // minutes, during which an ancestor could have become an escaping link.
+        check_containment(&self.worktree, &self.absolute)?;
         let parent = self.absolute.parent().ok_or(OutputPathError::Traversal)?;
         fs::create_dir_all(parent).map_err(|error| OutputPathError::Io(error.to_string()))?;
         let canonical_parent =
@@ -297,6 +300,20 @@ mod tests {
             OutputPathError::OutsideWorktree
         );
         assert!(!outside.path().join("hero.png").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_late_escaping_symlink_does_not_create_directories_outside_the_worktree() {
+        let dir = worktree();
+        let outside = TempDir::new().unwrap();
+        let output = validate_output_path(dir.path(), "later/deeper/new/hero.png").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("later")).unwrap();
+        assert_eq!(
+            output.write_no_overwrite(b"x").unwrap_err(),
+            OutputPathError::OutsideWorktree
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

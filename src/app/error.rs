@@ -123,6 +123,13 @@ pub enum AppError {
     )]
     DirtySourceRepository,
     #[error(
+        "Mission {mission_id} package {package_id} cannot start while the source checkout has uncommitted changes.\n  Commit changes from integrated packages before starting the next package; stash unrelated changes if needed.\n  The Senate does not stage or commit for you. Retry your original `senate mission start` command with the same options."
+    )]
+    MissionIntegrationNeedsCommit {
+        mission_id: crate::domain::MissionId,
+        package_id: crate::domain::WorkPackageId,
+    },
+    #[error(
         "Pull request {url} cannot be read.\n  {detail}\n  The run would give every stage the same nothing, so it is not started.\n  Fix: make {host} reachable for `gh` — VPN, or HTTPS_PROXY when the host sits behind a proxy — check with `gh auth status --hostname {host}`, then start the run again, or paste the pull request title, description and diff into the task instead."
     )]
     PullRequestUnreachable {

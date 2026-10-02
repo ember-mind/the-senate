@@ -79,5 +79,7 @@ export async function askConsul(message) {
     headers: { 'X-Senate-Token': token || '', 'Content-Type': 'application/json' },
     body: JSON.stringify({ message }),
   });
-  return r.json();
+  const result = await r.json();
+  if (!r.ok) throw new Error(result.error || `/api/consul: ${r.status}`);
+  return result;
 }

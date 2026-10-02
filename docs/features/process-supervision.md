@@ -3,6 +3,7 @@
 Keep every native provider invocation alive and observable even when the Senate frontend goes away, with durable output and exit evidence.
 
 ## Sub-features
+- jira-environment: `SENATE_JIRA_*` variables are importer-private; neither the environment handoff nor the provider exec forwards them.
 - managed-process: one persisted attempt per external command, keyed `(run, stage, attempt, invocation)`, with `spec.json`, `stdin.jsonl`, `runtime.json`, `stdout.log`, `stderr.log`, `exit.json` under `~/.senate/runs/<run-id>/processes/<process-id>/`.
 - tmux-backend: isolated tmux server per process; launch is `senate __run-process <manifest>` as direct argv, never a shell string.
 - runner: `__run-process` validates manifest and ownership, receives forwarded environment over a `0600` Unix socket, clears the environment, spawns `senate __exec-process <manifest>` in its own process group, redirects output to append-only files, writes `runtime.json` then `exit.json`.

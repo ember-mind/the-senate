@@ -339,7 +339,7 @@ The child run's immutable input rendered from canonical mission state: mission g
 _Avoid_: Prompt, brief, delegation message
 
 **Package readiness**:
-A package is ready when every package it depends on is integrated, so the run that serves it starts on a checkout that already carries their changes.
+A package is ready when every package it depends on is integrated. Run creation additionally requires a clean source checkout: the operator commits transferred dependency changes before starting the next package, so its HEAD and managed worktree include them.
 _Avoid_: Unblocked, schedulable
 
 **Delivered**:
@@ -347,7 +347,7 @@ The package's current run completed. Its change is in the run's worktree, not ye
 _Avoid_: Done (in code and docs), merged
 
 **Integrated**:
-The delivered package's change reached the source checkout, on run evidence: the run is applied, or it completed with an empty delta. `mission integrate` and the control room's `I` apply the run first when its change is still in the worktree. Dependents may become ready. The control room says `in`.
+The delivered package's change reached the source checkout, on run evidence: the run is applied, or it completed with an empty delta. `mission integrate` and the control room's `I` apply the run first when its change is still in the worktree. Integration never stages or commits changes; the operator commits a nonempty transferred delta before starting the next package. Dependents may become ready, while Run creation still requires a clean source checkout. The control room says `in`.
 _Avoid_: Merged, accepted, applied package
 
 **Lead session**:

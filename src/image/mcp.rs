@@ -7,7 +7,7 @@
 //! Codex need from a stdio server: `initialize`, `notifications/initialized`,
 //! `ping`, `tools/list`, `tools/call`. Everything else is `-32601`.
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead, Write as _};
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -19,28 +19,66 @@ use super::service::{ImageToolCall, MAX_PROMPT_BYTES};
 /// `mcp__senate_image__image_generate`.
 pub const TOOL_NAME: &str = "image_generate";
 const PROTOCOL_VERSION: &str = "2025-06-18";
+const MAX_JSON_RPC_LINE_BYTES: usize = 64 * 1024;
 
 /// Runs the server on this process's stdin/stdout until stdin closes.
 ///
 /// # Errors
-/// Returns only a stdout write failure; malformed requests are answered,
-/// not fatal.
+/// Returns an I/O failure or an oversized/invalid UTF-8 frame. Malformed JSON
+/// within the frame limit receives a protocol error and does not stop the server.
 pub fn run_stdio_server(socket: &Path) -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    let mut input = stdin.lock();
     let mut out = stdout.lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    let mut line = Vec::with_capacity(1024);
+    while read_bounded_line(&mut input, &mut line)?.is_some() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        if let Some(response) = handle_line(&line, socket) {
+        let line = std::str::from_utf8(&line)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if let Some(response) = handle_line(line, socket) {
             serde_json::to_writer(&mut out, &response)?;
             out.write_all(b"\n")?;
             out.flush()?;
         }
     }
     Ok(())
+}
+
+/// Reads at most one bounded JSON-RPC frame. On overflow it stops before
+/// consuming the rest of that line; the shim exits instead of buffering an
+/// arbitrarily large request from a provider.
+fn read_bounded_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<Option<()>> {
+    line.clear();
+    loop {
+        let (consumed, terminated) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok((!line.is_empty()).then_some(()));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let consumed = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(consumed) > MAX_JSON_RPC_LINE_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("JSON-RPC line exceeds {MAX_JSON_RPC_LINE_BYTES} byte limit"),
+                ));
+            }
+            let content = if newline.is_some() {
+                consumed - 1
+            } else {
+                consumed
+            };
+            line.extend_from_slice(&available[..content]);
+            (consumed, newline.is_some())
+        };
+        reader.consume(consumed);
+        if terminated {
+            return Ok(Some(()));
+        }
+    }
 }
 
 /// One request line to at most one response. Notifications get none.
@@ -181,6 +219,52 @@ pub(crate) fn tool_definition() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_reader_preserves_multiple_frames_and_unterminated_final_frame() {
+        let input = b"{\"id\":1}\n\n{\"id\":2}";
+        let mut reader = std::io::Cursor::new(input.as_slice());
+        let mut line = Vec::new();
+        let mut frames = Vec::new();
+        while read_bounded_line(&mut reader, &mut line).unwrap().is_some() {
+            frames.push(line.clone());
+        }
+        assert_eq!(
+            frames,
+            [b"{\"id\":1}".to_vec(), Vec::new(), b"{\"id\":2}".to_vec()]
+        );
+    }
+
+    #[test]
+    fn an_oversized_frame_fails_before_the_rest_of_the_line_is_read() {
+        let mut input = vec![b'x'; MAX_JSON_RPC_LINE_BYTES * 16];
+        input.push(b'\n');
+        let input_len = input.len() as u64;
+        let mut reader = std::io::BufReader::with_capacity(4096, std::io::Cursor::new(input));
+        let mut line = Vec::new();
+        let error = read_bounded_line(&mut reader, &mut line).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(line.len() <= MAX_JSON_RPC_LINE_BYTES);
+        assert!(reader.get_ref().position() < input_len);
+    }
+
+    #[test]
+    fn frame_limit_includes_the_newline_and_accepts_exactly_bounded_eof() {
+        let mut input = vec![b'x'; MAX_JSON_RPC_LINE_BYTES - 1];
+        input.push(b'\n');
+        let mut reader = std::io::Cursor::new(input);
+        let mut line = Vec::new();
+        assert_eq!(read_bounded_line(&mut reader, &mut line).unwrap(), Some(()));
+        assert_eq!(line.len(), MAX_JSON_RPC_LINE_BYTES - 1);
+
+        let mut input = vec![b'x'; MAX_JSON_RPC_LINE_BYTES];
+        let mut reader = std::io::Cursor::new(input.clone());
+        assert_eq!(read_bounded_line(&mut reader, &mut line).unwrap(), Some(()));
+        assert_eq!(line.len(), MAX_JSON_RPC_LINE_BYTES);
+        input.push(b'\n');
+        let error = read_bounded_line(&mut std::io::Cursor::new(input), &mut line).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn initialize_list_and_unknown_methods_follow_json_rpc() {

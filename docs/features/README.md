@@ -9,17 +9,18 @@ Every command, flag and key here is copied from `src/cli/mod.rs` and `src/tui/in
 | Feature | Purpose | File |
 |---|---|---|
 | Run lifecycle | Start, inspect, stop, resume, recover, retry and resolve one run | [run-lifecycle.md](run-lifecycle.md) |
+| Jira | Import Cloud/Data Center issues into immutable Run inputs or Mission work packages | [jira.md](jira.md) |
 | Missions | Plan a multi-package project above runs, with dependencies, decisions, and integration | [missions.md](missions.md) |
 | Workflows | Built-in Fast/Standard/Deep/Review graphs plus fix and continue cycles | [workflows.md](workflows.md) |
 | Control room | Ratatui TUI: screens, overlays, exact keys | [control-room.md](control-room.md) |
 | The Senate | `senate world`: local-only HTTP server and browser 3D view of a campaign | [world.md](world.md) |
 | Workspace | Isolated worktrees, apply, discard, pull request | [workspace.md](workspace.md) |
-| Verification | Run the repository's own checks after the last edit; failed checks block completion and apply, not `pr` | [verification.md](verification.md) |
-| Routing | Roles to providers/models, `--provider`, `--profile recommended`, v1 frozen / v2 current, `retry --provider` per-stage override | [routing.md](routing.md) |
+| Verification | Run the repository's own checks after the last edit; failed checks block apply; Standard/Deep still complete and `pr` remains available | [verification.md](verification.md) |
+| Routing | Roles to providers/models, `--provider`, `--profile recommended`, v1/v2 frozen / v3 current, `retry --provider` per-stage override | [routing.md](routing.md) |
 | Native providers | Claude Code, Codex, and opencode adapters, permissions, sandboxes, attention | [providers.md](providers.md) |
 | Evaluations | `eval list/run/report`, suites under `evals/`, evidence layout | [evaluations.md](evaluations.md) |
 | Observability and effort | Usage/latency/prompt-bytes telemetry and `--effort` | [observability-and-effort.md](observability-and-effort.md) |
-| Image generation | `--allow-image-generation`: the Implementer generates PNGs into the worktree through a Senate-owned OpenAI-backed tool | [image-generation.md](image-generation.md) |
+| Image generation | `--allow-image-generation`: the Implementer generates PNGs into the worktree through a Senate-owned local Codex CLI tool with native authentication | [image-generation.md](image-generation.md) |
 | Configuration and appearance | Data/config paths and the environment variables the TUI reads | [configuration.md](configuration.md) |
 | Install, update, doctor | Bootstrap installer, self-update, environment check | [install-update-doctor.md](install-update-doctor.md) |
 | Process supervision | tmux-backed managed processes, `__run-process`, `__exec-process` | [process-supervision.md](process-supervision.md) |

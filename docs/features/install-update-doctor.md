@@ -3,6 +3,7 @@
 Get an official binary onto the machine, keep it current with verified self-updates, and check that the local environment can run The Senate.
 
 ## Sub-features
+- staging-integrity: every self-update uses its own private temporary staging file beside the executable; cleanup cannot remove another update's staging file. A staged binary must exit successfully from `--version` as well as report the expected version before replacement. Self-update and registration version probes require a successful exit, cap stdout/stderr at 64 KiB each, and time out after 5 s including output draining; timeout kills and reaps the process group. Both omit Jira importer credentials. No failed probe replaces a binary or writes a registration receipt.
 - install.sh: downloads a release asset, verifies SHA-256 against the release's `SHA256SUMS`, checks `--version`, installs to `~/.local/bin/senate`, then registers the install through a hidden subcommand.
 - update-check: automatic at most once per 24 h using public GitHub release metadata, cached in `update.json`; typed commands always check now.
 - update-install: staging file beside the target, checksum and version verified, renamed into place; running process keeps the loaded binary.
@@ -37,6 +38,7 @@ TUI update overlay: `↑`/`↓` toggle Yes/No, `Enter` confirm, `Esc` dismiss.
 - `install.sh` — bootstrap installer.
 - `src/cli/mod.rs` — `UpdateArgs` (`--check`, `--yes`), hidden `RegisterOfficialInstall`, `InstallSourceOf`.
 - `src/cli/commands.rs` — `update`, `confirm_install`, `install_update`, `doctor`, `print_distribution`, `register_official_install`, `install_source_of`.
+- `src/providers/verify/runner.rs` — bounded exact-argv supervision shared by version probes.
 - `src/update/mod.rs` — `UpdateService`, `check_now` vs cached check, `detect_install_source`, `OFFICIAL_REPOSITORY`, `CURRENT_VERSION`.
 - `src/update/release.rs`, `src/update/cache.rs`, `src/update/install.rs`, `src/update/installer.rs` — GitHub release source, `update.json`, `install.json` receipt, verified install.
 - `src/tui/app.rs` — `handle_update_intent`, `begin_update_install`.

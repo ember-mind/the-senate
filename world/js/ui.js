@@ -15,6 +15,9 @@ export class UI {
     this.body = $('#panel-body');
     this.prompt = $('#prompt');
     this.open = null;
+    this.orderRequest = 0;
+    this.orderPending = null;
+    this.talkRequest = 0;
     $('#panel-close').addEventListener('click', () => this.close());
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Escape') this.close();
@@ -58,6 +61,9 @@ export class UI {
 
   close() {
     this.open = null;
+    this.orderRequest++;
+    this.orderPending = null;
+    this.talkRequest++;
     this.panel.hidden = true;
   }
 
@@ -109,7 +115,13 @@ export class UI {
   async openOrder(id, quiet = false) {
     const s = this.state;
     const o = s?.orders.find((x) => x.id === id);
-    if (!o) return;
+    if (!o) {
+      if (this.open?.kind === 'order' && this.open.id === id) this.showOrderUnavailable(id);
+      return;
+    }
+    if (quiet && this.orderPending === id) return;
+    const request = ++this.orderRequest;
+    this.orderPending = id;
     if (!quiet) this.show('order', id, `<header><small>ORDER</small><h2>${escapeHtml(o.title)}</h2></header><p class="muted">Loading…</p>`);
     let d = null;
     try {
@@ -117,8 +129,16 @@ export class UI {
     } catch (e) {
       d = { error: String(e.message || e) };
     }
+    if (request !== this.orderRequest) return;
+    this.orderPending = null;
     if (this.open?.kind !== 'order' || this.open.id !== id) return;
-    const who = o.worker ? `${escapeHtml(o.worker.provider)}${o.worker.model ? ` · ${escapeHtml(o.worker.model)}` : ''}` : '—';
+    const latest = this.state;
+    const currentOrder = latest?.orders.find((x) => x.id === id);
+    if (!currentOrder) {
+      this.showOrderUnavailable(id);
+      return;
+    }
+    const who = currentOrder.worker ? `${escapeHtml(currentOrder.worker.provider)}${currentOrder.worker.model ? ` · ${escapeHtml(currentOrder.worker.model)}` : ''}` : '—';
     const stages = (d?.stages || [])
       .map((st) => `<li class="stage ${st.status}"><span>${escapeHtml(st.label)}</span><span>${escapeHtml(st.status)}${st.provider ? ` · ${escapeHtml(st.provider)}` : ''}</span></li>`)
       .join('');
@@ -126,18 +146,28 @@ export class UI {
     this.show(
       'order',
       id,
-      `<header><small>COHORT ${numeral(o.cohort)} · ORDER</small><h2>${escapeHtml(o.title)}</h2></header>
-      <div class="kv"><span>State</span><b class="st-${o.state}">${STATE_WORD[o.state] || o.state}</b>
+      `<header><small>COHORT ${numeral(currentOrder.cohort)} · ORDER</small><h2>${escapeHtml(currentOrder.title)}</h2></header>
+      <div class="kv"><span>State</span><b class="st-${currentOrder.state}">${STATE_WORD[currentOrder.state] || currentOrder.state}</b>
       <span>Worker</span><b>${who}</b>
-      ${o.since ? `<span>For</span><b>${since(o.since, Date.parse(s.at))}</b>` : ''}</div>
-      ${o.reason ? `<div class="reason">${escapeHtml(o.reason)}</div>` : ''}
+      ${currentOrder.since ? `<span>For</span><b>${since(currentOrder.since, Date.parse(latest.at))}</b>` : ''}</div>
+      ${currentOrder.reason ? `<div class="reason">${escapeHtml(currentOrder.reason)}</div>` : ''}
       ${d?.goal ? `<h3>Goal</h3><p>${escapeHtml(d.goal)}</p>` : ''}
       ${d?.acceptance?.length ? `<h3>Accepted when</h3><ul>${d.acceptance.map((a) => `<li>${escapeHtml(a)}</li>`).join('')}</ul>` : ''}
       ${stages ? `<h3>Stages</h3><ul class="stages">${stages}</ul>` : ''}
       ${outcome('Verification', d?.verification)}
       ${outcome('Independent review', d?.review)}
       ${d?.error ? `<p class="muted">${escapeHtml(d.error)}</p>` : ''}
-      <p class="hint">In the terminal: <code>senate mission show ${escapeHtml(s.campaign?.id || '')}</code></p>`,
+      <p class="hint">In the terminal: <code>senate mission show ${escapeHtml(latest.campaign?.id || '')}</code></p>`,
+    );
+  }
+
+  showOrderUnavailable(id) {
+    this.orderRequest++;
+    this.orderPending = null;
+    this.show(
+      'order',
+      id,
+      '<header><small>ORDER</small><h2>Order unavailable</h2></header><p class="muted">This Order is no longer in the selected campaign.</p>',
     );
   }
 
@@ -170,6 +200,8 @@ export class UI {
     );
     const form = this.body.querySelector('#ask');
     const text = this.body.querySelector('#ask-text');
+    const button = form.querySelector('button');
+    let sending = false;
     text.addEventListener('keydown', (e) => {
       e.stopPropagation();
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -179,24 +211,42 @@ export class UI {
     });
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (sending) return;
       const msg = text.value.trim();
       if (!msg) return;
-      text.value = '';
-      const r = await askConsul(msg);
+      sending = true;
+      text.disabled = true;
+      button.disabled = true;
+      let r;
+      try {
+        r = await askConsul(msg);
+      } catch (error) {
+        r = { accepted: false, reason: String(error.message || error) };
+      } finally {
+        sending = false;
+        text.disabled = false;
+        button.disabled = false;
+      }
+      if (this.body.querySelector('#ask') !== form) return;
       const talk = this.body.querySelector('#talk');
-      if (!r.accepted) talk.insertAdjacentHTML('beforeend', `<p class="muted">${escapeHtml(r.reason || 'Not sent.')}</p>`);
-      else this.loadTalk();
+      if (!r.accepted) talk?.insertAdjacentHTML('beforeend', `<p class="muted">${escapeHtml(r.reason || 'Not sent.')}</p>`);
+      else {
+        text.value = '';
+        this.loadTalk();
+      }
     });
     this.loadTalk();
   }
 
   async loadTalk() {
+    const request = ++this.talkRequest;
     let log;
     try {
       log = await fetchConsul();
     } catch (e) {
       log = { turns: [], error: String(e.message || e) };
     }
+    if (request !== this.talkRequest || this.open?.kind !== 'consul') return;
     const talk = this.body.querySelector('#talk');
     if (!talk) return;
     const turns = (log.turns || [])

@@ -10,8 +10,8 @@ pub(crate) struct PngHeader {
     pub height: u32,
 }
 
-/// Checks the signature, the IHDR chunk, and that an IEND chunk closes the
-/// stream. A truncated or non-PNG body fails closed.
+/// Checks the header, every chunk's bounds and checksum, image-data presence,
+/// and the final IEND. Pixel decompression remains the image reader's job.
 pub(crate) fn validate(bytes: &[u8]) -> Result<PngHeader, &'static str> {
     if bytes.len() < 8 + 25 + 12 {
         return Err("shorter than the smallest valid PNG");
@@ -35,6 +35,48 @@ pub(crate) fn validate(bytes: &[u8]) -> Result<PngHeader, &'static str> {
     }
     if !bytes.ends_with(&iend()) {
         return Err("stream does not end with IEND");
+    }
+    let valid_depth = match bytes[25] {
+        0 => matches!(bytes[24], 1 | 2 | 4 | 8 | 16),
+        2 | 4 | 6 => matches!(bytes[24], 8 | 16),
+        3 => matches!(bytes[24], 1 | 2 | 4 | 8),
+        _ => false,
+    };
+    if !valid_depth || bytes[26] != 0 || bytes[27] != 0 || bytes[28] > 1 {
+        return Err("unsupported IHDR encoding");
+    }
+    let mut offset = 8;
+    let mut image_data = false;
+    while offset < bytes.len() {
+        let header = bytes
+            .get(offset..offset + 8)
+            .ok_or("truncated chunk header")?;
+        let length =
+            u32::from_be_bytes(header[..4].try_into().expect("four length bytes")) as usize;
+        let end = offset
+            .checked_add(12)
+            .and_then(|start| start.checked_add(length))
+            .filter(|end| *end <= bytes.len())
+            .ok_or("truncated chunk data")?;
+        let kind = &header[4..];
+        if !kind.iter().all(u8::is_ascii_alphabetic) {
+            return Err("invalid chunk type");
+        }
+        let stored =
+            u32::from_be_bytes(bytes[end - 4..end].try_into().expect("four checksum bytes"));
+        if crc(&bytes[offset + 4..end - 4]) != stored {
+            return Err("chunk checksum mismatch");
+        }
+        match kind {
+            b"IHDR" if offset != 8 => return Err("duplicate IHDR"),
+            b"IDAT" => image_data |= length > 0,
+            b"IEND" if length != 0 || end != bytes.len() => return Err("invalid IEND placement"),
+            _ => {}
+        }
+        offset = end;
+    }
+    if !image_data {
+        return Err("missing image data");
     }
     Ok(PngHeader { width, height })
 }
@@ -162,5 +204,22 @@ mod tests {
         let mut jpeg_like = synthesize(2, 2, 1);
         jpeg_like[1] = b'J';
         assert_eq!(validate(&jpeg_like).unwrap_err(), "missing PNG signature");
+    }
+
+    #[test]
+    fn a_valid_header_and_end_do_not_hide_missing_or_corrupt_image_data() {
+        let valid = synthesize(2, 2, 1);
+        let mut no_data = valid[..33].to_vec();
+        no_data.extend(iend());
+        assert_eq!(validate(&no_data).unwrap_err(), "missing image data");
+        let mut corrupt = valid.clone();
+        corrupt[41] ^= 1;
+        assert_eq!(validate(&corrupt).unwrap_err(), "chunk checksum mismatch");
+        let mut truncated = valid.clone();
+        truncated[33..37].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(validate(&truncated).unwrap_err(), "truncated chunk data");
+        let mut duplicate = valid[..33].to_vec();
+        duplicate.extend_from_slice(&valid[8..]);
+        assert_eq!(validate(&duplicate).unwrap_err(), "duplicate IHDR");
     }
 }

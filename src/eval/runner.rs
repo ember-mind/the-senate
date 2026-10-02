@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ use super::scorer::{ScoreInput, ScoredOutcome, ScoringError, score};
 use super::suite::{EvalSuite, EvalSuiteError};
 
 const VALIDATION_OUTPUT_LIMIT: usize = 256 * 1024;
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(1800);
 /// Upper bound on safe eval permission continuations per case. Each resume
 /// grants at least one new exact in-worktree Edit; anything beyond this is a
 /// runaway session, not legitimate work.
@@ -412,9 +413,26 @@ fn initialize_repository(path: &Path) -> Result<(), EvalRunnerError> {
         &["config", "user.email", "eval@senate.invalid"][..],
         &["config", "user.name", "The Senate Eval"][..],
         &["add", "-A"][..],
-        &["commit", "-qm", "eval baseline"][..],
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "eval baseline",
+        ][..],
     ] {
-        let output = Command::new("git").args(args).current_dir(path).output()?;
+        let argv = args
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        let output = crate::git::Git::default()
+            .output(path, &argv, &[])
+            .map_err(|error| EvalRunnerError::Git {
+                args: args.join(" "),
+                message: error.to_string(),
+            })?;
         if !output.status.success() {
             return Err(EvalRunnerError::Git {
                 args: args.join(" "),
@@ -453,24 +471,44 @@ fn run_validation(
     repository: &Path,
     commands: &[ValidationCommand],
 ) -> Result<ValidationOutcome, EvalRunnerError> {
+    run_validation_with_timeout(repository, commands, VALIDATION_TIMEOUT)
+}
+
+fn run_validation_with_timeout(
+    repository: &Path,
+    commands: &[ValidationCommand],
+    timeout: Duration,
+) -> Result<ValidationOutcome, EvalRunnerError> {
+    use crate::providers::verify::runner::{CommandExit, run_argv};
     let mut passed = true;
     let mut log = String::new();
     for command in commands {
-        let output = Command::new(command.program)
-            .args(command.args)
-            .current_dir(repository)
-            .output()?;
+        let description = format!("{} {}", command.program, command.args.join(" "));
+        let report = run_argv(
+            &description,
+            command.program,
+            command.args,
+            repository,
+            timeout,
+        );
+        if let CommandExit::CouldNotStart(error) | CommandExit::StatusUnavailable(error) =
+            &report.exit
+        {
+            return Err(std::io::Error::other(error.clone()).into());
+        }
         writeln!(
             log,
-            "$ {} {}\nexit: {}\nstdout:\n{}\nstderr:\n{}",
+            "$ {} {}\nexit: {:?}\nstdout ({} earlier bytes omitted):\n{}\nstderr ({} earlier bytes omitted):\n{}",
             command.program,
             command.args.join(" "),
-            output.status,
-            bounded_text(&output.stdout),
-            bounded_text(&output.stderr)
+            report.exit,
+            report.stdout.dropped,
+            bounded_text(&report.stdout.bytes),
+            report.stderr.dropped,
+            bounded_text(&report.stderr.bytes)
         )
         .expect("String write cannot fail");
-        passed &= output.status.success();
+        passed &= report.exit.succeeded();
     }
     Ok(ValidationOutcome {
         passed,
@@ -631,6 +669,36 @@ mod tests {
     use crate::eval::case::ROLE_CORE_CASES_V3;
     use crate::eval::result::EvalMetrics;
     use crate::eval::scorer::{ScoreInput, ScoringError, score};
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_preserves_exact_argv_and_times_out_inherited_output_pipes() {
+        let directory = tempdir().unwrap();
+        let exact = run_validation_with_timeout(
+            directory.path(),
+            &[ValidationCommand {
+                program: "sh",
+                args: &["-c", "printf 'two words'"],
+            }],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(exact.passed);
+        assert!(exact.output.contains("two words"));
+        let started = std::time::Instant::now();
+        let stalled = run_validation_with_timeout(
+            directory.path(),
+            &[ValidationCommand {
+                program: "sh",
+                args: &["-c", "sleep 6 & exit 0"],
+            }],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!stalled.passed);
+        assert!(stalled.output.contains("TimedOut"));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
 
     fn prepare(case: &EvalCase) -> (TempDir, PathBuf) {
         let directory = tempdir().unwrap();

@@ -69,6 +69,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --test process_tmux --no-fail-fast
       - run: cargo test
+      - run: node --experimental-vm-modules tests/world_ui.mjs
 
   build:
     name: ${{ matrix.target }}

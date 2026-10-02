@@ -198,6 +198,8 @@ pub enum RegistrationError {
     NotAFile(PathBuf),
     #[error("{0} is not executable")]
     NotExecutable(PathBuf),
+    #[error("{path} could not report its version: {reason}")]
+    VersionProbeFailed { path: PathBuf, reason: String },
     #[error("{path} does not identify itself as The Senate")]
     NotSenate { path: PathBuf },
     #[error("{path} reports version {reported}, but this build is {expected}")]
@@ -235,10 +237,13 @@ pub fn register_official_install(
             return Err(RegistrationError::NotExecutable(executable.to_path_buf()).into());
         }
     }
-    let output = std::process::Command::new(executable)
-        .arg("--version")
-        .output()?;
-    let reported = String::from_utf8_lossy(&output.stdout);
+    let output =
+        super::installer::probe_version(executable, super::installer::VERSION_PROBE_TIMEOUT)
+            .map_err(|reason| RegistrationError::VersionProbeFailed {
+                path: executable.to_path_buf(),
+                reason,
+            })?;
+    let reported = String::from_utf8_lossy(&output);
     // `senate <version>` or `senate <version>`: both halves must be right, so neither an unrelated
     // executable nor a differently versioned The Senate can be registered.
     let mut words = reported.split_whitespace();
