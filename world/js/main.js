@@ -15,6 +15,7 @@ import { loadTrees } from './architecture.js';
 import { loadKay } from './kay.js';
 import { UI } from './ui.js';
 import { placeCamera } from './tour.js';
+import { QUALITY, ResolutionBudget } from './quality.js';
 
 const SCHEMA = 1;
 if (new URLSearchParams(location.search).get('manual') === '1') window.__senateClock = 0;
@@ -46,10 +47,31 @@ const controls = new Controls(world, canvas, {
   onModeChange: (mode) => {
     document.body.dataset.mode = mode;
     document.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('on', b.dataset.view === mode));
+    document.querySelector('#battle-view').classList.remove('on');
   },
 });
 document.body.dataset.mode = 'overview';
-document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => controls.setMode(b.dataset.view)));
+const overviewPose = { ...controls.goal, target: controls.goal.target.clone() };
+document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => {
+  controls.setMode(b.dataset.view);
+  if (b.dataset.view === 'overview') {
+    controls.goal.target.copy(overviewPose.target);
+    controls.goal.yaw = overviewPose.yaw;
+    controls.goal.pitch = overviewPose.pitch;
+    controls.goal.dist = overviewPose.dist;
+  }
+  document.querySelectorAll('[data-view]').forEach(view => view.classList.toggle('on', view === b));
+  document.querySelector('#battle-view').classList.remove('on');
+}));
+document.querySelector('#battle-view').addEventListener('click', () => {
+  const cohort = director.cohorts.find(c => !c.done && c.phase === 'field') || director.cohorts.find(c => !c.done);
+  const pos = cohort?.slot.pos || world.field.slots[0].pos;
+  controls.focus(pos, 22);
+  controls.goal.yaw = 0.86;
+  controls.goal.pitch = 0.34;
+  document.querySelectorAll('[data-view]').forEach(b => b.classList.remove('on'));
+  document.querySelector('#battle-view').classList.add('on');
+});
 if (params.get('view') === 'walk') controls.setMode('walk');
 
 // Optional fixed camera for repeatable captures: ?cam=x,y,z,tx,ty,tz
@@ -106,15 +128,27 @@ let t = 0;
 let frames = 0;
 let fpsT = 0;
 const stats = { fps: 0, quality, calls: 0, triangles: 0 };
+const budget = new ResolutionBudget(world.renderer.getPixelRatio());
+const adaptive = !manual && !Object.hasOwn(QUALITY, params.get('quality'));
+let shadowAge = Infinity;
+const perf = params.get('perf') === '1' ? document.body.appendChild(document.createElement('output')) : null;
+if (perf) { perf.id = 'performance'; perf.setAttribute('aria-live', 'off'); }
 window.__senate = { stats, world, director, controls };
 function frame(fixedDt) {
+  const started = performance.now();
   clock.update();
-  const dt = typeof fixedDt === 'number' ? fixedDt : Math.min(clock.getDelta(), 0.05);
+  const elapsed = typeof fixedDt === 'number' ? fixedDt : clock.getDelta();
+  const dt = typeof fixedDt === 'number' ? fixedDt : Math.min(elapsed, 0.05);
+  if (adaptive) {
+    const ratio = budget.sample(elapsed);
+    if (ratio !== null) world.setPixelRatio(ratio);
+  }
   world.renderer.info.reset();
   t += dt;
   world.uniforms.uTime.value = t;
   stepFeeds(dt);
   director.update(dt, t);
+  world.battleEffects.update(dt);
   controls.update(dt, t);
   let focus = null;
   if (tour) focus = placeCamera(world.camera, t);
@@ -150,16 +184,28 @@ function frame(fixedDt) {
     });
     void p;
   }
-  world.composer.render();
+  // Render one shadow map at most, including AO/depth-of-field passes. Low
+  // quality updates at 30 Hz; higher tiers preserve each animation frame.
+  shadowAge += dt;
+  if (quality !== 'low' || shadowAge >= 1 / 30) {
+    world.renderer.shadowMap.needsUpdate = true;
+    shadowAge = 0;
+  }
+  world.scene.updateMatrixWorld(true);
+  world.composer.render(dt);
   labels.render(world.scene, world.camera);
   stats.calls = world.renderer.info.render.calls;
   stats.triangles = world.renderer.info.render.triangles;
+  stats.frameMs = performance.now() - started;
+  stats.pixelRatio = world.renderer.getPixelRatio();
+  stats.particles = world.battleEffects.dustPool.live + world.battleEffects.sparkPool.live;
   frames += 1;
-  fpsT += dt;
+  fpsT += elapsed;
   if (fpsT > 1) {
     stats.fps = Math.round(frames / fpsT);
     frames = 0;
     fpsT = 0;
+    if (perf) perf.textContent = `${stats.fps} FPS · ${stats.frameMs.toFixed(1)} ms CPU · ${stats.calls} draws · DPR ${stats.pixelRatio.toFixed(2)} · ${quality}${adaptive ? ' auto' : ''}`;
   }
   scheduled = false;
   schedule();

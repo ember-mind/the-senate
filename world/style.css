@@ -125,9 +125,16 @@ body.offline #offline { display: block; }
   #panel { top: auto; height: 60vh; }
 }
 
+@media (max-width: 520px) {
+  #brand { right: 16px; }
+}
+
+@media (max-width: 900px) { #views { top: 108px; } }
+
 /* Capture mode: world and labels only. */
 body.clean #brand, body.clean #views, body.clean #help, body.clean #prompt { display: none !important; }
 body.nolabels #labels { display: none !important; }
+#performance { position: fixed; bottom: 12px; left: 12px; z-index: 6; padding: 7px 10px; border-radius: 6px; background: #211a13dd; color: #f1e4c6; font: 11px ui-monospace, monospace; pointer-events: none; }
 body.tour .label.agent { padding: 12px 22px 14px; border-radius: 16px; min-width: 220px; max-width: 640px; border-width: 2px; }
 body.tour .label.agent::after { width: 22px; height: 22px; bottom: -12px; }
 body.tour .label b { font-size: 22px; }

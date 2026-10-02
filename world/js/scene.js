@@ -30,20 +30,32 @@ import { PALETTE, buildMaterials } from './materials.js';
 import { flameMesh, makeBanner, makeCampaignBoard, makeCensorTable, makeLamp, makeShelf, makeTabletRack, makeWorkstation } from './props.js';
 import { makeCanvasTexture } from './textures.js';
 import { battleSlots, buildBattlefield, bake, box, columnGeometry } from './architecture.js';
+import { BattleEffects } from './battle.js';
+import { QUALITY, chooseQuality } from './quality.js';
 
-export const QUALITY = {
-  low: { pixelRatio: 1, shadow: 1024, ao: false, bloom: false, antialias: false },
-  medium: { pixelRatio: 1.5, shadow: 2048, ao: false, bloom: true, antialias: true },
-  high: { pixelRatio: 2, shadow: 2048, ao: true, bloom: true, antialias: true },
-};
+export { QUALITY };
 
 export function pickQuality() {
   const param = new URLSearchParams(location.search).get('quality');
-  if (param && QUALITY[param]) return param;
   const cores = navigator.hardwareConcurrency || 4;
   const mobile = /Mobi|Android/i.test(navigator.userAgent);
-  if (mobile || cores <= 4) return 'low';
-  return 'high';
+  return chooseQuality(param, cores, mobile);
+}
+
+// AO needs a depth/normal pass, not the same resolution as the colour pass.
+// Particles have their own billboard shaders and must not enter its G-buffer.
+class WorldGTAOPass extends GTAOPass {
+  setSize(width, height) {
+    super.setSize(Math.max(1, Math.round(width * 0.5)), Math.max(1, Math.round(height * 0.5)));
+  }
+
+  render(renderer, writeBuffer, readBuffer, dt, maskActive) {
+    const meshes = this.effects ? [this.effects.dustPool.mesh, this.effects.sparkPool.mesh] : [];
+    const visible = meshes.map(m => m.visible);
+    meshes.forEach(m => { m.visible = false; });
+    try { super.render(renderer, writeBuffer, readBuffer, dt, maskActive); }
+    finally { meshes.forEach((m, i) => { m.visible = visible[i]; }); }
+  }
 }
 
 function skyDome() {
@@ -104,10 +116,12 @@ export function createWorld(canvas, qualityName) {
   const Q = QUALITY[qualityName];
   // Dusk: a lighting variant for stills and the site (?dusk=1). Same world, later hour.
   const dusk = new URLSearchParams(location.search).get('dusk') === '1';
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: Q.antialias, powerPreference: 'high-performance' });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, Q.pixelRatio));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
+  renderer.shadowMap.autoUpdate = false;
+  renderer.shadowMap.needsUpdate = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
@@ -124,16 +138,18 @@ export function createWorld(canvas, qualityName) {
   // Light.
   const sunDir = dusk ? new THREE.Vector3(-0.8, 0.16, 0.45).normalize() : new THREE.Vector3(-0.55, 0.62, 0.56).normalize();
   const sun = new THREE.DirectionalLight(dusk ? '#ff8a4a' : '#ffe0b0', dusk ? 1.1 : 3.6);
-  sun.position.copy(sunDir).multiplyScalar(90);
+  // Include the fort and field in the shadow footprint, not only the campus.
+  sun.target.position.set(-24, 0, -4);
+  sun.position.copy(sunDir).multiplyScalar(130).add(sun.target.position);
   sun.castShadow = true;
   sun.shadow.mapSize.set(Q.shadow, Q.shadow);
   const sc = sun.shadow.camera;
-  sc.left = -58;
-  sc.right = 58;
-  sc.top = 48;
-  sc.bottom = -48;
+  sc.left = -88;
+  sc.right = 88;
+  sc.top = 68;
+  sc.bottom = -68;
   sc.near = 20;
-  sc.far = 220;
+  sc.far = 280;
   sun.shadow.bias = -0.0004;
   sun.shadow.normalBias = 0.04;
   sun.shadow.radius = 3;
@@ -142,7 +158,11 @@ export function createWorld(canvas, qualityName) {
   scene.add(hemi);
 
   const pmrem = new THREE.PMREMGenerator(renderer);
-  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  const environment = new RoomEnvironment();
+  const environmentTarget = pmrem.fromScene(environment, 0.04);
+  scene.environment = environmentTarget.texture;
+  environment.dispose();
+  pmrem.dispose();
   scene.environmentIntensity = 0.35;
 
   const sky = skyDome();
@@ -160,7 +180,7 @@ export function createWorld(canvas, qualityName) {
   const uniforms = { uTime: { value: 0 } };
 
   buildGround(scene, M);
-  buildBattlefield(scene, M);
+  buildBattlefield(scene, M, uniforms);
   buildMosaic(scene, mosaicTexture());
   buildHills(scene, dusk);
   if (dusk) {
@@ -365,12 +385,19 @@ export function createWorld(canvas, qualityName) {
   scene.add(censorGlow);
 
   // Post-processing.
-  const composer = new EffectComposer(renderer);
+  // Canvas MSAA cannot smooth offscreen composer buffers. Sample the actual
+  // colour target, leaving AO and bloom at their own lower resolutions.
+  const target = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
+    type: THREE.HalfFloatType, samples: Math.min(Q.samples, renderer.capabilities.maxSamples),
+  });
+  const composer = new EffectComposer(renderer, target);
+  const battleEffects = new BattleEffects(scene, qualityName);
   composer.addPass(new RenderPass(scene, camera));
   let gtao = null;
   if (Q.ao) {
-    gtao = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
-    gtao.blendIntensity = 1.0;
+    gtao = new WorldGTAOPass(scene, camera, window.innerWidth, window.innerHeight);
+    gtao.effects = battleEffects;
+    gtao.blendIntensity = 0.8;
     gtao.updateGtaoMaterial({ radius: 0.45, distanceExponent: 1.6, thickness: 1.4, scale: 1.2 });
     composer.addPass(gtao);
   }
@@ -416,8 +443,18 @@ export function createWorld(canvas, qualityName) {
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
     composer.setSize(window.innerWidth, window.innerHeight);
+    if (grade) grade.uniforms.uAspect.value = camera.aspect;
   }
   window.addEventListener('resize', resize);
+  resize();
+  // main.js updates the hierarchy once after posing every figure. Colour,
+  // AO, depth of field and CSS labels reuse the same committed frame pose.
+  scene.matrixWorldAutoUpdate = false;
+
+  function setPixelRatio(ratio) {
+    renderer.setPixelRatio(ratio);
+    composer.setPixelRatio(ratio);
+  }
 
   return {
     renderer,
@@ -441,5 +478,9 @@ export function createWorld(canvas, qualityName) {
     bokeh,
     grade,
     quality: qualityName,
+    battleEffects,
+    setPixelRatio,
+    environmentTarget,
+    fullMotion: cine || new URLSearchParams(location.search).get('tour') === '1',
   };
 }

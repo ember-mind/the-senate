@@ -1,0 +1,19 @@
+
+running 1 test
+app::mission_drive::tests::drive_runs_a_bounded_parallel_wave_and_reuses_policy_after_reopen --- FAILED
+
+failures:
+
+---- app::mission_drive::tests::drive_runs_a_bounded_parallel_wave_and_reuses_policy_after_reopen stdout ----
+
+thread 'app::mission_drive::tests::drive_runs_a_bounded_parallel_wave_and_reuses_policy_after_reopen' (75931825) panicked at src/app/mission_drive.rs:721:14:
+called `Result::unwrap()` on an `Err` value: Store(EventTimestampRegression { event_id: EventId(Ulid(2165137933326468391614792880025799749)), previous: 2026-10-02T16:55:21.730113Z, occurred_at: 2026-10-02T16:55:21.730022Z })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    app::mission_drive::tests::drive_runs_a_bounded_parallel_wave_and_reuses_policy_after_reopen
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1150 filtered out; finished in 0.85s
+
+error: test failed, to rerun pass `--lib`

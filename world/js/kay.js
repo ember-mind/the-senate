@@ -4,7 +4,8 @@
 // the procedural figures expose, so the director drives either kind.
 
 import * as THREE from '../vendor/three.module.min.js';
-import { GLTFLoader, SkeletonUtils } from '../vendor/three.module.min.js';
+import { GLTFLoader, SkeletonUtils, mergeGeometries } from '../vendor/three.module.min.js';
+import { battleBeat } from './battle.js';
 
 const SOURCES = {
   Mage: 'assets/chars/Mage.min.glb',
@@ -15,10 +16,47 @@ const SOURCES = {
 const HIDE = /^(1H_|2H_|Knife|Throwable|Spellbook|Mug|Barbarian_Round_Shield|Mage_Hat|Barbarian_Hat)/;
 
 let KAY = null;
+
+// KayKit exports six body parts with one atlas, one bind transform and the
+// same joints. Merge those compatible parts once, before cloning characters:
+// one body draw and one bone texture per figure instead of six of each.
+export function mergeCharacterSkin(scene, animations = []) {
+  const groups = [];
+  scene.updateMatrixWorld(true);
+  scene.traverse(o => {
+    if (!o.isSkinnedMesh || Array.isArray(o.material) || Object.keys(o.geometry.morphAttributes).length) return;
+    if (animations.some(clip => clip.tracks.some(track => track.name.startsWith(`${o.name}.`)))) return;
+    const compatible = ref => ref.parent === o.parent && ref.material === o.material
+      && ref.matrix.equals(o.matrix) && ref.bindMatrix.equals(o.bindMatrix)
+      && ref.skeleton.bones.length === o.skeleton.bones.length
+      && ref.skeleton.bones.every((bone, i) => bone === o.skeleton.bones[i]
+        && ref.skeleton.boneInverses[i].equals(o.skeleton.boneInverses[i]));
+    const group = groups.find(parts => compatible(parts[0]));
+    if (group) group.push(o);
+    else groups.push([o]);
+  });
+  for (const parts of groups) {
+    if (parts.length < 2) continue;
+    const geometry = mergeGeometries(parts.map(o => o.geometry), false);
+    if (!geometry) continue;
+    const ref = parts[0];
+    const merged = new THREE.SkinnedMesh(geometry, ref.material);
+    merged.name = `${ref.name.split('_')[0]}_MergedBody`;
+    merged.position.copy(ref.position);
+    merged.quaternion.copy(ref.quaternion);
+    merged.scale.copy(ref.scale);
+    merged.bind(ref.skeleton, ref.bindMatrix);
+    ref.parent.add(merged);
+    parts.forEach(o => o.removeFromParent());
+  }
+  return scene;
+}
+
 export async function loadKay() {
   try {
     const loader = new GLTFLoader();
     const entries = await Promise.all(Object.entries(SOURCES).map(async ([k, url]) => [k, await loader.loadAsync(url)]));
+    entries.forEach(([, gltf]) => mergeCharacterSkin(gltf.scene, gltf.animations));
     KAY = Object.fromEntries(entries);
   } catch (error) {
     console.warn('[senate] KayKit characters unavailable, using procedural figures', error);
@@ -78,6 +116,7 @@ const ROLES = {
 };
 
 let CONTACT = null;
+const CONTACT_GEOMETRY = new THREE.CircleGeometry(0.42, 16).rotateX(-Math.PI / 2);
 function contactMaterial() {
   if (CONTACT) return CONTACT;
   const c = document.createElement('canvas');
@@ -96,23 +135,49 @@ function contactMaterial() {
 // axes and a round shield): a short gladius and a curved rectangular
 // scutum in legion red. Sized in the rig's own units.
 let ARMS = null;
+function weaponGeometry(parts) {
+  const geometries = parts.map(([source, color, metal, rough]) => {
+    const geometry = source.clone();
+    const count = geometry.attributes.position.count;
+    const colors = new Float32Array(count * 3);
+    const tint = new THREE.Color(color);
+    for (let i = 0; i < count; i++) colors.set([tint.r, tint.g, tint.b], i * 3);
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('aMetal', new THREE.BufferAttribute(new Float32Array(count).fill(metal), 1));
+    geometry.setAttribute('aRough', new THREE.BufferAttribute(new Float32Array(count).fill(rough), 1));
+    return geometry;
+  });
+  const merged = mergeGeometries(geometries, false);
+  geometries.forEach(g => g.dispose());
+  return merged;
+}
+
 function armsParts() {
   if (ARMS) return ARMS;
-  const steel = new THREE.MeshStandardMaterial({ color: '#c9ccd1', metalness: 0.9, roughness: 0.3 });
-  const brass = new THREE.MeshStandardMaterial({ color: '#b58a3f', metalness: 0.85, roughness: 0.35 });
-  const grip = new THREE.MeshStandardMaterial({ color: '#3b2a1c', roughness: 0.8 });
   const blade = new THREE.BoxGeometry(0.07, 0.62, 0.02).translate(0, 0.42, 0);
   const guard = new THREE.BoxGeometry(0.17, 0.04, 0.06).translate(0, 0.1, 0);
   const handle = new THREE.CylinderGeometry(0.025, 0.025, 0.16, 6).translate(0, 0.02, 0);
   const shield = new THREE.CylinderGeometry(0.75, 0.75, 0.95, 16, 1, true, -0.38, 0.76).translate(0, 0, -0.72);
   const boss = new THREE.SphereGeometry(0.1, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2).rotateX(Math.PI / 2).translate(0, 0, 0.04);
-  ARMS = { steel, brass, grip, blade, guard, handle, shield, boss, shieldMats: new Map() };
+  // One draw per hand, preserving each part's colour and PBR response through
+  // vertex attributes: steel blade, bronze guard/boss, wood grip, painted shield.
+  const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 1, side: THREE.DoubleSide });
+  material.onBeforeCompile = shader => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aMetal; attribute float aRough; varying float vMetal; varying float vRough;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvMetal = aMetal; vRough = aRough;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vMetal; varying float vRough;')
+      .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = vRough;')
+      .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = vMetal;');
+  };
+  material.customProgramCacheKey = () => 'roman-arms-v1';
+  ARMS = {
+    material,
+    sword: weaponGeometry([[blade, '#c9ccd1', 0.9, 0.3], [guard, '#b58a3f', 0.85, 0.35], [handle, '#3b2a1c', 0, 0.8]]),
+    shield: weaponGeometry([[shield, '#8e2219', 0, 0.7], [boss, '#b58a3f', 0.85, 0.35]]),
+  };
   return ARMS;
-}
-function shieldMaterial(tunic) {
-  const A = armsParts();
-  if (!A.shieldMats.has(tunic)) A.shieldMats.set(tunic, new THREE.MeshStandardMaterial({ color: tunic, roughness: 0.7, side: THREE.DoubleSide }));
-  return A.shieldMats.get(tunic);
 }
 // The pack's hand slots hold weapons along +y and shields facing +z.
 function arm(rig) {
@@ -120,20 +185,16 @@ function arm(rig) {
   const right = rig.model.getObjectByName('handslotr');
   const left = rig.model.getObjectByName('handslotl');
   if (right) {
-    const sword = new THREE.Group();
-    sword.add(new THREE.Mesh(A.blade, A.steel), new THREE.Mesh(A.guard, A.brass), new THREE.Mesh(A.handle, A.grip));
-    sword.traverse((o) => (o.castShadow = true));
+    const sword = new THREE.Mesh(A.sword, A.material);
+    sword.castShadow = true;
     right.add(sword);
   }
   if (left) {
-    const scutum = new THREE.Group();
-    const face = new THREE.Mesh(A.shield, shieldMaterial('#8e2219'));
-    const boss = new THREE.Mesh(A.boss, A.brass);
-    scutum.add(face, boss);
+    const scutum = new THREE.Mesh(A.shield, A.material);
     // The left slot's y runs across the forearm; stand the scutum upright.
     scutum.rotation.z = Math.PI / 2;
     scutum.position.set(0, 0.02, 0.16);
-    scutum.traverse((o) => (o.castShadow = true));
+    scutum.castShadow = true;
     left.add(scutum);
   }
 }
@@ -168,9 +229,10 @@ export function makeKayFigure(role, { pose = 'stand', tunic, variant = 0, armed 
   // Our world is ~1.75 m per person; KayKit characters stand ~2.2 units.
   model.scale.setScalar(0.78);
   const root = new THREE.Group();
+  root.userData.ownedMaterials = new Set(cache.values());
   root.add(model);
   // A soft contact shadow so the figure sits on the floor, not above it.
-  const blob = new THREE.Mesh(new THREE.CircleGeometry(0.42, 24).rotateX(-Math.PI / 2), contactMaterial());
+  const blob = new THREE.Mesh(CONTACT_GEOMETRY, contactMaterial());
   blob.position.y = 0.012;
   blob.renderOrder = 1;
   root.add(blob);
@@ -192,6 +254,9 @@ export function makeKayFigure(role, { pose = 'stand', tunic, variant = 0, armed 
     pose,
     current: null,
     lastT: null,
+    lastCallT: null,
+    animationDebt: 0,
+    lastMotion: null,
     phase: variant * 1.7,
     // The procedural rig's handles, kept so shared code never trips.
     legs: [],
@@ -202,6 +267,13 @@ export function makeKayFigure(role, { pose = 'stand', tunic, variant = 0, armed 
   };
   if (armed) arm(rig);
   root.userData.rig = rig;
+  root.userData.disposeRig = () => {
+    mixer.stopAllAction();
+    mixer.uncacheRoot(model);
+    const skeletons = new Set();
+    model.traverse(o => { if (o.isSkinnedMesh) skeletons.add(o.skeleton); });
+    skeletons.forEach(s => s.dispose());
+  };
   return root;
 }
 
@@ -235,12 +307,24 @@ const CLIP = {
 };
 
 export function kayMotion(rig, name, t, speed = 1) {
+  // Distant/reserve poses update less often; combat timing and movement still
+  // run every frame. Carry fractional time so 30/60 Hz displays reach the same
+  // pose budget. State changes always bypass this visual-only throttle.
+  if (rig.animationHz) {
+    const elapsed = rig.lastCallT === null ? 0 : Math.max(0, t - rig.lastCallT);
+    rig.lastCallT = t;
+    rig.animationDebt = Math.min(0.2, rig.animationDebt + elapsed);
+    const interval = 1 / rig.animationHz;
+    if (rig.lastT !== null && rig.lastMotion === name && rig.animationDebt + 1e-6 < interval) return;
+    rig.animationDebt = Math.max(0, rig.animationDebt - interval);
+    rig.lastMotion = name;
+  }
   const dt = rig.lastT === null ? 0 : Math.min(0.1, Math.max(0, t - rig.lastT));
   rig.lastT = t;
   // Fighting cycles through three sword strokes, each Cohort member on its
   // own beat so a rank never swings in unison.
   const FIGHT = ['1H_Melee_Attack_Chop', '1H_Melee_Attack_Slice_Diagonal', '1H_Melee_Attack_Stab'];
-  const clip = name === 'fight' ? FIGHT[Math.floor((t + rig.phase) / 1.15) % 3] : rig.pose === 'sit' && (name === 'stand' || name === 'study') ? 'Sit_Chair_Idle' : CLIP[name] || 'Idle';
+  const clip = name === 'fight' ? FIGHT[battleBeat(t, rig.phase).cycle % 3] : rig.pose === 'sit' && (name === 'stand' || name === 'study') ? 'Sit_Chair_Idle' : CLIP[name] || 'Idle';
   play(rig, clip, name === 'fight' ? 0.18 : 0.35);
   // A faster walk plays the clip faster, so feet keep up with the ground.
   if (rig.current) rig.mixer.clipAction(rig.clips[rig.current]).timeScale = name === 'walk' || name === 'jog' ? speed : 1;

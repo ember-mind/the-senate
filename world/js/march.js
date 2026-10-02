@@ -1,5 +1,6 @@
 // The legions on the battlefield. Each Order with a live run has a Cohort:
-// a standard-bearer and three legionaries in the Cohort's colour. When the
+// a standard-bearer and two ranks of three legionaries (one on low quality).
+// Soldiers wear the Cohort's colour. When the
 // Order starts between two snapshots, the Cohort musters in the Legion Hall
 // and marches out of the back gates to its place facing the enemy fort;
 // what it does there follows the Order (fighting while code is written,
@@ -11,31 +12,15 @@
 
 import * as THREE from '../vendor/three.module.min.js';
 import { MOTIONS, makeFigure } from './figures.js';
+import { battleBeat, standardMaterial } from './battle.js';
 
 const PACE = 2.3; // marching, metres per second
 const JOG = 4.2; // the double-quick outside the walls
 const FADE = 0.8; // seconds to appear or vanish
 
-// A soft round puff of dust, shared by every march.
-const PUFF = new THREE.CircleGeometry(0.5, 16).rotateX(-Math.PI / 2);
-let DUST = null;
-function dustTexture() {
-  if (DUST) return DUST;
-  const c = document.createElement('canvas');
-  c.width = c.height = 64;
-  const g = c.getContext('2d');
-  const grad = g.createRadialGradient(32, 32, 2, 32, 32, 32);
-  grad.addColorStop(0, 'rgba(214,190,150,0.9)');
-  grad.addColorStop(1, 'rgba(214,190,150,0)');
-  g.fillStyle = grad;
-  g.fillRect(0, 0, 64, 64);
-  DUST = new THREE.CanvasTexture(c);
-  return DUST;
-}
-
 // The standard the bearer carries: the Cohort's numeral on its colour,
 // seal-red with "!" when the Order needs you.
-function carriedStandard(numeral, tunic) {
+function carriedStandard(numeral, tunic, time) {
   const g = new THREE.Group();
   const wood = new THREE.MeshStandardMaterial({ color: '#4a3322', roughness: 0.8 });
   const bronze = new THREE.MeshStandardMaterial({ color: '#b08440', metalness: 0.7, roughness: 0.35 });
@@ -64,18 +49,19 @@ function carriedStandard(numeral, tunic) {
     tex.needsUpdate = true;
   };
   draw(false);
-  const flag = new THREE.Mesh(new THREE.PlaneGeometry(0.95, 0.95), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9, side: THREE.DoubleSide }));
+  const flag = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.25, 6, 8), standardMaterial({ map: tex }, time));
   // Broadside to the march, so it reads from the sides and from above.
   flag.rotation.y = Math.PI / 2;
-  flag.position.y = 2.75;
+  flag.position.y = 2.6;
   const tip = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.18, 6), bronze);
   tip.position.y = 3.5;
   g.add(staff, bar, flag, tip);
   g.traverse((o) => {
-    if (o.isMesh) o.castShadow = true;
+    if (o.isMesh) o.castShadow = o !== flag;
   });
   let halted = false;
   g.userData.flag = flag;
+  g.userData.materials = new Set([wood, bronze, flag.material]);
   g.userData.setHalt = (halt) => {
     if (halt === halted) return;
     halted = halt;
@@ -85,28 +71,34 @@ function carriedStandard(numeral, tunic) {
     g.traverse((o) => {
       if (!o.isMesh) return;
       o.geometry.dispose();
-      o.material.map?.dispose();
-      o.material.dispose();
     });
+    tex.dispose();
+    g.userData.materials.forEach(m => m.dispose());
   };
   return g;
 }
 
 // Every material under a figure, made fadeable once.
 function fadeable(fig) {
-  const mats = [];
+  const cache = new Map();
   fig.traverse((o) => {
-    if (!o.isMesh || !o.material) return;
+    if (!o.isMesh || !o.material || !o.visible) return;
     // clone() drops the Cohort recolouring hooks; carry them over.
     const src = o.material;
-    o.material = src.clone();
-    o.material.onBeforeCompile = src.onBeforeCompile;
-    if (Object.hasOwn(src, 'customProgramCacheKey')) o.material.customProgramCacheKey = src.customProgramCacheKey;
-    mats.push(o.material);
+    if (!cache.has(src)) {
+      const own = fig.userData.ownedMaterials?.has(src) || fig.userData.standardMaterials?.has(src);
+      const mat = own ? src : src.clone();
+      mat.onBeforeCompile = src.onBeforeCompile;
+      if (Object.hasOwn(src, 'customProgramCacheKey')) mat.customProgramCacheKey = src.customProgramCacheKey;
+      cache.set(src, mat);
+    }
+    o.material = cache.get(src);
   });
-  return mats;
+  return [...cache.values()];
 }
 function setOpacity(mats, a) {
+  if (mats.opacity === a) return;
+  mats.opacity = a;
   for (const m of mats) {
     const see = a < 0.999;
     if (m.transparent !== see) {
@@ -142,44 +134,54 @@ function route(points) {
 
 // Formations, in the unit's own frame (+z is where it faces). On the march
 // the Cohort is two abreast behind its standard, narrow enough for the
-// gates; on the field it deploys into a rank of three with the standard
-// behind.
+// gates; on the field it deploys into two ranks of three with the standard behind.
 const MARCH = [new THREE.Vector3(0, 0, 1.2), new THREE.Vector3(-0.55, 0, 0), new THREE.Vector3(0.55, 0, 0), new THREE.Vector3(0, 0, -1.1)];
 // The warband, in the Cohort's frame: a loose rank a few paces ahead.
-const BAND = [new THREE.Vector3(-1.3, 0, 3.4), new THREE.Vector3(0.1, 0, 3.1), new THREE.Vector3(1.4, 0, 3.5)];
-const LINE = [new THREE.Vector3(0, 0, -0.8), new THREE.Vector3(-1.15, 0, 0.9), new THREE.Vector3(0, 0, 0.9), new THREE.Vector3(1.15, 0, 0.9)];
+const BAND = [new THREE.Vector3(-1.2, 0, 2.55), new THREE.Vector3(0, 0, 2.65), new THREE.Vector3(1.2, 0, 2.5),
+  new THREE.Vector3(-1.35, 0, 4.05), new THREE.Vector3(0.05, 0, 4.2), new THREE.Vector3(1.4, 0, 4.1)];
+const LINE = [new THREE.Vector3(0, 0, -2), new THREE.Vector3(-1.2, 0, 0.9), new THREE.Vector3(0, 0, 0.9), new THREE.Vector3(1.2, 0, 0.9),
+  new THREE.Vector3(-1.2, 0, -0.6), new THREE.Vector3(0, 0, -0.6), new THREE.Vector3(1.2, 0, -0.6)];
+for (let i = 4; i < LINE.length; i++) MARCH.push(new THREE.Vector3(i % 2 ? 0.55 : -0.55, 0, -1.8 - Math.floor((i - 4) / 2) * 1.2));
 
 export class Cohort {
   // slot: { pos, yaw } on the field; path: muster in the Legion Hall, its
   // back gate, the campus gate, then the road; label: the CSS2D label object.
-  constructor(scene, { slot, path, numeral, tunic, variant, label, arriving, fortGate }) {
+  constructor(scene, { slot, path, numeral, tunic, variant, label, arriving, fortGate, effects, time, quality = 'high', camera, fullMotion = false }) {
     this.scene = scene;
     this.fortGate = fortGate;
     this.variant = variant;
     this.band = null;
     this.slot = slot;
     this.done = false;
-    this.puffs = [];
+    this.effects = effects;
+    this.camera = camera;
+    this.fullMotion = fullMotion;
+    this.soldierCount = quality === 'low' ? 3 : 6;
+    this.rotation = new THREE.Quaternion();
+    this.offset = new THREE.Vector3();
+    this.forward = new THREE.Vector3(Math.sin(slot.yaw), 0, Math.cos(slot.yaw));
+    this.impactPoint = new THREE.Vector3();
     this.puffClock = 0;
     this.t = 0;
     this.mode = 'atease';
     this.halt = false;
 
     this.bearer = makeFigure('cohort', { tunic, variant });
-    this.standard = carriedStandard(numeral, tunic);
+    this.standard = carriedStandard(numeral, tunic, time || { value: 0 });
     this.standard.position.set(0.32, 0, 0.18);
     this.bearer.add(this.standard);
+    this.bearer.userData.standardMaterials = this.standard.userData.materials;
     this.bearer.add(label);
     this.label = label;
-    label.position.set(0, 3.7, 0);
-    this.members = [this.bearer, ...[1, 2, 3].map((i) => makeFigure('cohort', { tunic, variant: variant + i, armed: true }))].map((fig) => {
+    label.position.set(0, 4.1, 0);
+    this.members = [this.bearer, ...Array.from({ length: this.soldierCount }, (_, i) => makeFigure('cohort', { tunic, variant: variant + i + 1, armed: true }))].map((fig) => {
       const mats = fadeable(fig);
       scene.add(fig);
-      return { fig, mats };
+      return { fig, mats, impactCycle: -1, answerCycle: -1 };
     });
     // Each soldier on its own beat.
     this.members.forEach((m, i) => {
-      if (m.fig.userData.rig) m.fig.userData.rig.phase = variant * 1.7 + i * 0.83;
+      if (m.fig.userData.rig) m.fig.userData.rig.phase = variant * 1.7 + ((i - 1 + 3) % 3) * 0.43;
     });
 
     this.out = route([...path, slot.pos]);
@@ -208,7 +210,7 @@ export class Cohort {
   // The warband: three barbarians. Sallying, they run out of the fort's gate
   // to their places; otherwise they are simply there.
   raiseBand(sally) {
-    this.band = BAND.map((_, i) => {
+    this.band = BAND.slice(0, this.soldierCount).map((_, i) => {
       const fig = makeFigure('barbarian', { variant: this.variant * 3 + i });
       const mats = fadeable(fig);
       const spot = this.bandSpot(i);
@@ -220,9 +222,9 @@ export class Cohort {
         fig.position.copy(spot);
         fig.rotation.y = this.slot.yaw + Math.PI;
       }
-      if (fig.userData.rig) fig.userData.rig.phase = this.variant * 2.3 + i * 1.1 + 0.5;
+      if (fig.userData.rig) fig.userData.rig.phase = this.variant * 1.7 + (i % 3) * 0.43;
       this.scene.add(fig);
-      return { fig, mats, run: sally ? route([from, spot]) : null, s: 0, fade: sally ? 0 : 1 };
+      return { fig, mats, spot, run: sally ? route([from, spot]) : null, s: 0, fade: sally ? 0 : 1 };
     });
   }
 
@@ -259,6 +261,7 @@ export class Cohort {
     for (const b of this.band || []) {
       this.scene.remove(b.fig);
       b.mats.forEach((x) => x.dispose());
+      b.fig.userData.disposeRig?.();
     }
     this.band = null;
   }
@@ -299,40 +302,20 @@ export class Cohort {
   }
 
   place({ p, yaw }, offsets, blend = null) {
-    const rot = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+    this.rotation.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, yaw);
     this.members.forEach((m, i) => {
-      const off = blend ? MARCH[i].clone().lerp(LINE[i], blend) : offsets[i];
-      m.fig.position.copy(p).add(off.clone().applyQuaternion(rot));
+      this.offset.copy(blend !== null ? MARCH[i] : offsets[i]);
+      if (blend !== null) this.offset.lerp(LINE[i], Math.min(1, Math.max(0, blend)));
+      m.fig.position.copy(p).add(this.offset.applyQuaternion(this.rotation));
       m.fig.rotation.y = yaw;
-    });
-  }
-
-  dust(pos) {
-    const mat = new THREE.MeshBasicMaterial({ map: dustTexture(), transparent: true, depthWrite: false, opacity: 0.5 });
-    const s = new THREE.Mesh(PUFF, mat);
-    s.position.copy(pos).add(new THREE.Vector3((Math.random() - 0.5) * 0.3, 0.04, (Math.random() - 0.5) * 0.3));
-    s.scale.setScalar(0.4);
-    s.userData.life = 0;
-    this.scene.add(s);
-    this.puffs.push(s);
-  }
-
-  stepPuffs(dt) {
-    this.puffs = this.puffs.filter((s) => {
-      s.userData.life += dt;
-      const u = s.userData.life / 0.9;
-      s.scale.setScalar(0.4 + u * 1.1);
-      s.material.opacity = 0.5 * (1 - u);
-      if (u < 1) return true;
-      this.scene.remove(s);
-      s.material.dispose();
-      return false;
     });
   }
 
   update(dt, t, k) {
     this.t += dt;
-    this.stepPuffs(dt);
+    const distant = this.camera && this.camera.position.distanceTo(this.slot.pos) > 36;
+    this.members.forEach((m, i) => { m.fig.userData.rig.animationHz = !this.fullMotion && this.phase === 'field' && (distant || i > 3) ? 24 : 60; });
+    this.band?.forEach((b, i) => { b.fig.userData.rig.animationHz = !this.fullMotion && this.phase === 'field' && (distant || i >= 3) ? 24 : 60; });
     this.updateBand(dt, t, k);
     let motion = null;
     let speed = 1;
@@ -402,7 +385,7 @@ export class Cohort {
       this.puffClock += dt;
       if (this.puffClock > (motion === 'jog' ? 0.1 : 0.18)) {
         this.puffClock = 0;
-        this.dust(this.members[Math.floor(Math.random() * this.members.length)].fig.position);
+        this.effects?.dust(this.members[Math.floor(this.s / 0.4) % this.members.length].fig.position);
       }
     }
   }
@@ -425,10 +408,15 @@ export class Cohort {
       return;
     }
     // In place: the band answers what the Cohort is doing.
-    const act = { fight: 'fight', guard: 'fight', atease: 'atease' }[this.mode] || 'stand';
-    for (const b of this.band) {
+    const engaged = this.phase === 'field' && (this.mode === 'fight' || this.mode === 'guard');
+    for (const [i, b] of this.band.entries()) {
       if (b.run) continue;
+      const beat = battleBeat(t, b.fig.userData.rig.phase);
+      const attack = engaged && i < 3 && beat.beat > 0.5;
+      const act = engaged ? attack ? 'fight' : 'guard' : this.mode === 'atease' ? 'atease' : 'stand';
       MOTIONS[this.phase === 'field' ? act : 'stand'](b.fig.userData.rig, t, k);
+      b.fig.position.copy(b.spot);
+      if (engaged && i < 3) b.fig.position.addScaledVector(this.forward, -beat.answer * 0.28 + (this.mode === 'fight' ? beat.advance * 0.12 : 0));
     }
   }
 
@@ -447,8 +435,28 @@ export class Cohort {
     bearer.fig.rotation.y = this.slot.yaw;
     if (this.mode === 'scout') MOTIONS.hail(brig, t, k);
     else MOTIONS.stand(brig, t, k);
-    const act = { fight: 'fight', guard: 'guard', atease: 'atease', scout: 'stand', stand: 'stand' }[this.mode] || 'stand';
-    soldiers.forEach((m) => MOTIONS[act](m.fig.userData.rig, t, k));
+    const engaged = this.mode === 'fight' || this.mode === 'guard';
+    soldiers.forEach((m, i) => {
+      const beat = battleBeat(t, m.fig.userData.rig.phase);
+      const front = i < 3;
+      const attack = front && this.mode === 'fight' && beat.beat < 0.5;
+      const act = engaged ? attack ? 'fight' : 'guard' : this.mode === 'atease' ? 'atease' : 'stand';
+      MOTIONS[act](m.fig.userData.rig, t, k);
+      this.rotation.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, this.slot.yaw);
+      m.fig.position.copy(this.slot.pos).add(this.offset.copy(LINE[i + 1]).applyQuaternion(this.rotation));
+      if (!engaged || !front || this.band?.[i]?.run || !this.band?.[i]) return;
+      m.fig.position.addScaledVector(this.forward, attack ? beat.advance * 0.3 : -beat.answer * 0.1);
+      if (this.mode === 'fight' && beat.beat >= 0.28 && m.impactCycle !== beat.cycle) {
+        m.impactCycle = beat.cycle;
+        this.impactPoint.copy(m.fig.position).addScaledVector(this.forward, 0.8);
+        this.effects?.impact(this.impactPoint);
+      }
+      if (beat.beat >= 0.72 && m.answerCycle !== beat.cycle) {
+        m.answerCycle = beat.cycle;
+        this.impactPoint.copy(m.fig.position).addScaledVector(this.forward, 0.45);
+        this.effects?.impact(this.impactPoint, true);
+      }
+    });
   }
 
   dispose() {
@@ -457,14 +465,10 @@ export class Cohort {
     this.disposeBand();
     for (const m of this.members) {
       this.scene.remove(m.fig);
-      m.mats.forEach((x) => x.dispose());
+      m.mats.forEach((x) => { if (!this.standard.userData.materials.has(x)) x.dispose(); });
+      m.fig.userData.disposeRig?.();
     }
     this.standard.userData.dispose();
-    for (const s of this.puffs) {
-      this.scene.remove(s);
-      s.material.dispose();
-    }
-    this.puffs = [];
   }
 }
 

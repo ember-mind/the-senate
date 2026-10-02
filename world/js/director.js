@@ -263,6 +263,11 @@ export class Director {
       label: l.obj,
       arriving,
       fortGate: new THREE.Vector3(LAYOUT.field.fortX + 3, 0.02, 0),
+      effects: this.w.battleEffects,
+      time: this.w.uniforms.uTime,
+      quality: this.w.quality,
+      camera: this.w.camera,
+      fullMotion: this.w.fullMotion,
     });
     this.cohorts.push(cohort);
     if (arriving) {

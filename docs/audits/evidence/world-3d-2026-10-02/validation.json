@@ -1,0 +1,59 @@
+{
+  "base": "cbcdef74e75b36893ba254c0d2d559901dad7475",
+  "snapshot": {
+    "cargo_fmt": 0,
+    "cargo_clippy": 0,
+    "cargo_test": 0,
+    "unit_passed": 1118,
+    "integration_passed": 81,
+    "native_ignored": 3
+  },
+  "shared_checkout": {
+    "cargo_fmt": 0,
+    "cargo_clippy": 0,
+    "cargo_test": "1150 unit tests passed; Mission Drive EventTimestampRegression confirmed on isolated retry"
+  },
+  "javascript": {
+    "world_render": 0,
+    "world_ui": 0
+  },
+  "sha256": {
+    "world/js/battle.js": "fe96fa3e05ba9259be24ebbfcca3cfe01a1ab8cd79b711f654fa7badec0109bf",
+    "world/js/quality.js": "08a67121114961d73a4b6515c9f60c173076d84edff79adc11c296fdc5d61220",
+    "world/js/kay.js": "d8ec8d8f3120bff51e3886a8efdd1a83f8c26b00e2fb1c6d4bb391fe09659d5a",
+    "world/js/march.js": "32c528cc62e80c8861453ff510e0d7d8651ca43d3b4b224d4a577f1d624e575f",
+    "world/js/scene.js": "3ff197658bd3ee3262b6ee150afd248d1687aec4d68bf88a5e2b202e0a36587e",
+    "world/js/main.js": "c49204ee39856d9328005a2667cab9225507477fbd8bc9d2ed3faf617ea6f4df",
+    "world/js/architecture.js": "3d552fd569c9410078f57ca8e00873ae7b381f4c8b95fcf4dfca4804f95f3b66",
+    "world/js/director.js": "7351430e6359957770db8c88ea4be09a0abd3563e73f0123b3f2d06d42a46de1",
+    "world/js/demo.js": "d5d22ba4a658e8f17e869992413015f49d45e9b33029e0f44f54a7df4a76c074",
+    "world/js/figures.js": "d669e30c238658709dad6671c9d43e11dbbc3b886020a3b0db61eac31d981c3a",
+    "world/index.html": "b7980e207289f58f856d37eabbbd28c9ad78d5800242cb2a53dc65a5e60707c1",
+    "world/style.css": "7ba409b37aa2f7195edef9901ff1143f6daf5ae1eefaec6250885a666d8304f6",
+    "tests/world_render.mjs": "60f18e3e3eca97fd55aca801cc7d655200a103677b84cd37faa7645a2b786e30"
+  },
+  "publication": {
+    "base": "205b232b4c36e031e75a95d91ab2ca102d54bdc4",
+    "scope": "3D rendering and battle; concurrent 2D files excluded",
+    "javascript_world_render": 0,
+    "javascript_world_ui": 0,
+    "cargo_fmt": 0,
+    "cargo_clippy": 0,
+    "browser": "Battle camera and standalone main.js entry verified",
+    "sha256": {
+      "world/js/battle.js": "fe96fa3e05ba9259be24ebbfcca3cfe01a1ab8cd79b711f654fa7badec0109bf",
+      "world/js/quality.js": "08a67121114961d73a4b6515c9f60c173076d84edff79adc11c296fdc5d61220",
+      "world/js/kay.js": "d8ec8d8f3120bff51e3886a8efdd1a83f8c26b00e2fb1c6d4bb391fe09659d5a",
+      "world/js/march.js": "32c528cc62e80c8861453ff510e0d7d8651ca43d3b4b224d4a577f1d624e575f",
+      "world/js/scene.js": "3ff197658bd3ee3262b6ee150afd248d1687aec4d68bf88a5e2b202e0a36587e",
+      "world/js/main.js": "c49204ee39856d9328005a2667cab9225507477fbd8bc9d2ed3faf617ea6f4df",
+      "world/js/architecture.js": "3d552fd569c9410078f57ca8e00873ae7b381f4c8b95fcf4dfca4804f95f3b66",
+      "world/js/director.js": "7351430e6359957770db8c88ea4be09a0abd3563e73f0123b3f2d06d42a46de1",
+      "world/js/demo.js": "d5d22ba4a658e8f17e869992413015f49d45e9b33029e0f44f54a7df4a76c074",
+      "world/js/figures.js": "d669e30c238658709dad6671c9d43e11dbbc3b886020a3b0db61eac31d981c3a",
+      "world/index.html": "1142085658ba27c3a73c9f8120b0f0f2e1ffafae33688a99a64a66cf3e1b2b0e",
+      "world/style.css": "4e15e63c6d4575e48504727bf5d6caa54fa5dca4851dfd5675c6986125a2e951",
+      "tests/world_render.mjs": "60f18e3e3eca97fd55aca801cc7d655200a103677b84cd37faa7645a2b786e30"
+    }
+  }
+}

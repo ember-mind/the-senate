@@ -279,6 +279,9 @@ export function makeFigure(role = 'cohort', { pose = 'stand', tunic, variant = 0
   for (const part of [skirt, head, ...arms.flatMap((a) => [a.shoulder, a.elbow]), ...legs.flatMap((l) => [l.hip, l.knee])]) bakeDirect(part);
   bakeDirect(chest);
   rest(rig);
+  root.userData.disposeRig = () => root.traverse(o => {
+    if (o.isMesh && o.geometry.userData.baked) o.geometry.dispose();
+  });
   return root;
 }
 

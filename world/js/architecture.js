@@ -6,6 +6,7 @@ import * as THREE from '../vendor/three.module.min.js';
 import { mergeGeometries } from '../vendor/three.module.min.js';
 import { rng } from './textures.js';
 import { GLTFLoader } from '../vendor/three.module.min.js';
+import { standardMaterial } from './battle.js';
 
 // Authored trees from Blender (world/assets-src/trees.py); procedural
 // fallback when the file does not load.
@@ -74,6 +75,7 @@ export class Batch {
     const meshes = [];
     for (const [material, geometries] of this.parts) {
       const merged = mergeGeometries(geometries, false);
+      geometries.forEach(g => g.dispose());
       const mesh = new THREE.Mesh(merged, material);
       mesh.castShadow = castShadow;
       mesh.receiveShadow = receiveShadow;
@@ -714,6 +716,10 @@ export function bake(group, keep = []) {
   for (const o of doomed) o.parent.remove(o);
   for (const [material, { list, cast, receive }] of byMat) {
     const m = new THREE.Mesh(mergeGeometries(list, false), material);
+    list.forEach(g => g.dispose());
+    m.geometry.userData.baked = true;
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
     m.castShadow = cast;
     m.receiveShadow = receive;
     group.add(m);
@@ -732,22 +738,29 @@ export function battleSlots() {
 // A trampled earth patch that fades into the grass at its edge.
 function dirtTexture() {
   const c = document.createElement('canvas');
-  c.width = c.height = 256;
+  c.width = c.height = 512;
   const g = c.getContext('2d');
   const r = rng(77);
-  const grad = g.createRadialGradient(128, 128, 40, 128, 128, 128);
+  const grad = g.createRadialGradient(256, 256, 80, 256, 256, 256);
   grad.addColorStop(0, 'rgba(122,98,68,0.95)');
   grad.addColorStop(0.7, 'rgba(118,96,66,0.6)');
   grad.addColorStop(1, 'rgba(118,96,66,0)');
   g.fillStyle = grad;
-  g.fillRect(0, 0, 256, 256);
-  for (let i = 0; i < 900; i++) {
-    const x = r() * 256;
-    const y = r() * 256;
-    const d = Math.hypot(x - 128, y - 128) / 128;
+  g.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 3600; i++) {
+    const x = r() * 512;
+    const y = r() * 512;
+    const d = Math.hypot(x - 256, y - 256) / 256;
     if (d > 0.95) continue;
     g.fillStyle = `rgba(${70 + r() * 60},${58 + r() * 40},${40 + r() * 30},${0.25 * (1 - d)})`;
     g.fillRect(x, y, 2 + r() * 5, 1 + r() * 3);
+  }
+  // Parallel wagon ruts and broken foot tracks establish the siege ground.
+  for (const y of [230, 247, 265, 282]) {
+    g.strokeStyle = 'rgba(61,45,29,0.16)';
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(85, y); g.bezierCurveTo(180, y - 3, 320, y + 6, 426, y - 2); g.stroke();
   }
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
@@ -757,7 +770,7 @@ function dirtTexture() {
 // The battlefield beyond the west gate: trampled ground, a road out from the
 // gate, and the enemy's fort, an earthen rampart with a palisade and two
 // wooden towers. What the Cohorts face while their Orders are at work.
-export function buildBattlefield(scene, M) {
+export function buildBattlefield(scene, M, uniforms = { uTime: { value: 0 } }) {
   const F = LAYOUT.field;
   const dirt = new THREE.MeshStandardMaterial({ map: dirtTexture(), transparent: true, depthWrite: false, roughness: 1 });
   const patch = new THREE.Mesh(new THREE.PlaneGeometry(46, 44).rotateX(-Math.PI / 2), dirt);
@@ -795,15 +808,28 @@ export function buildBattlefield(scene, M) {
     b.add(box(2.8, 0.25, 2.8, 2), M.darkWood, { x: fx, y: 6.2, z: tz });
     for (const [dx, dz, w, d] of [[-1.35, 0, 0.12, 2.8], [1.35, 0, 0.12, 2.8], [0, -1.35, 2.8, 0.12], [0, 1.35, 2.8, 0.12]]) b.add(box(w, 0.9, d, 2), M.darkWood, { x: fx + dx, y: 6.75, z: tz + dz });
     b.add(new THREE.ConeGeometry(2.3, 1.4, 4), M.darkWood, { x: fx, y: 8.1, z: tz, ry: Math.PI / 4 });
+    // Cross bracing and bronze gate straps read even in a wide battlefield view.
+    for (const dz of [-1.08, 1.08]) {
+      b.add(box(0.16, 4.8, 0.14), M.darkWood, { x: fx + 1.1, y: 3.7, z: tz + dz, rz: 0.42 });
+    }
+  }
+  for (const y of [2, 3.1, 4]) b.add(box(0.36, 0.14, 4.4), M.bronze, { x: fx + 0.9, y, z: 0 });
+  // Broken stakes and stones stay outside the marching corridor and ranks.
+  const rock = new THREE.IcosahedronGeometry(0.22, 0);
+  for (let i = 0; i < 34; i++) {
+    const z = (i % 2 ? -1 : 1) * (20 + r() * 3);
+    const x = fx + 2 + r() * 25;
+    b.add(rock, earth, { x, y: 0.1, z, sy: 0.65, sx: 0.6 + r(), sz: 0.7 + r() });
+    if (i % 5 === 0) b.add(stake, M.darkWood, { x: x + 0.5, y: 0.25, z, rx: 1.35, ry: r() * 3 });
   }
   b.flush(scene, { name: 'fort' });
   // The enemy's banners: dark cloth on the towers.
   for (const tz of [-4.2, 4.2]) {
     const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.4, 6), M.darkWood);
     pole.position.set(fx, 9.6, tz);
-    const cloth = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.8), new THREE.MeshStandardMaterial({ color: '#2b2a33', roughness: 1, side: THREE.DoubleSide }));
+    const cloth = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.1, 6, 8), standardMaterial({ color: '#43333b' }, uniforms.uTime, tz));
     cloth.position.set(fx, 10.3, tz + 0.62);
-    cloth.castShadow = true;
+    cloth.castShadow = false;
     scene.add(pole, cloth);
   }
 }

@@ -61,6 +61,16 @@ const settledPair = [
 ];
 
 export const SCENARIOS = {
+  // Full field: six Orders, including a defensive rank running checks.
+  battle: () => world([
+    'Fix the free coupon', 'Fix the double charge', 'Keep the cart on reload',
+    'Check tax rounding', 'Verify the refund', 'Harden checkout',
+  ].map((title, i) => order(`o-battle-${i}`, i + 1, title, 'working', {
+    activity: i === 5 ? 'testing' : 'coding', worker: [deepseek, codex, claude][i % 3], since: minutesAgo(4 + i),
+  })), {
+    consul: { state: 'quiet', summary: ['Six Cohorts are on the field.', 'Cohort VI is running checks.'], lead_turns: 3 },
+    campaignExtra: { goal: 'Secure checkout and verify its behavior.' },
+  }),
   // Nothing is running. The Senate is quiet, and that is the point.
   quiet: () =>
     world(
