@@ -200,6 +200,81 @@ struct Fixture {
     data: PathBuf,
 }
 
+#[test]
+fn mission_drive_reuses_policy_and_waits_for_explicit_integration_across_processes() {
+    let fixture = Fixture::new();
+    let created = fixture.senate(&[
+        "mission",
+        "new",
+        "Driven",
+        "--goal",
+        "Two packages",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+    ]);
+    assert_success(&created);
+    let mission_id = String::from_utf8_lossy(&created.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Mission ")
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .to_owned();
+    for id in ["first", "second"] {
+        assert_success(&fixture.senate(&[
+            "mission",
+            "add",
+            &mission_id,
+            id,
+            "--title",
+            id,
+            "--goal",
+            "Deliver package",
+            "--workflow",
+            "fast",
+        ]));
+    }
+    let invalid = fixture.senate(&[
+        "mission",
+        "drive",
+        &mission_id,
+        "--max-parallel",
+        "0",
+        "--provider",
+        "fake",
+        "--once",
+    ]);
+    assert_eq!(invalid.status.code(), Some(1));
+    let driven = fixture.senate(&[
+        "mission",
+        "drive",
+        &mission_id,
+        "--max-parallel",
+        "1",
+        "--provider",
+        "fake",
+        "--once",
+    ]);
+    assert_success(&driven);
+    let text = String::from_utf8_lossy(&driven.stdout);
+    assert!(text.contains("delivered  first"), "{text}");
+    assert!(text.contains("ready      second"), "{text}");
+    assert!(text.contains("awaiting explicit integration"), "{text}");
+    let paused = fixture.senate(&["mission", "drive", &mission_id]);
+    assert_success(&paused);
+    assert!(String::from_utf8_lossy(&paused.stdout).contains("ready      second"));
+    assert_success(&fixture.senate(&["mission", "integrate", &mission_id, "first"]));
+    let resumed = fixture.senate(&["mission", "drive", &mission_id]);
+    assert_success(&resumed);
+    let text = String::from_utf8_lossy(&resumed.stdout);
+    assert!(text.contains("maximum 1 concurrent runs"), "{text}");
+    assert!(text.contains("delivered  second"), "{text}");
+    assert!(text.contains("integrated first"), "{text}");
+}
+
 impl Fixture {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();

@@ -5,6 +5,7 @@ mod error;
 mod image;
 mod migrations;
 mod mission;
+mod mission_drive;
 mod path;
 mod process;
 mod provider;
@@ -18,10 +19,12 @@ pub use error::StoreError;
 pub use image::ImageGenerationRecord;
 pub use migrations::DATABASE_SCHEMA_VERSION;
 pub use mission::{
-    LoadedMission, MISSION_INPUT_SCHEMA_VERSION, MISSION_SNAPSHOT_SCHEMA_VERSION,
-    MissionHandoffRecord, MissionInput, MissionInputError, MissionLeadBinding, MissionRevision,
-    MissionRunBinding, MissionSummary, SequencedMissionEvent, contract_sha256, sha256_hex,
+    LeadProposalApproval, LoadedMission, MISSION_INPUT_SCHEMA_VERSION,
+    MISSION_SNAPSHOT_SCHEMA_VERSION, MissionHandoffRecord, MissionInput, MissionInputError,
+    MissionLeadBinding, MissionRevision, MissionRunBinding, MissionSummary, SequencedMissionEvent,
+    contract_sha256, sha256_hex,
 };
+pub use mission_drive::MissionDriveRecord;
 pub use path::{
     database_file, install_receipt_file, process_root, update_cache_file, worktree_root,
     world_state_file,

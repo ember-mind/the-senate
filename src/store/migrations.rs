@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use super::StoreError;
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 12;
+pub const DATABASE_SCHEMA_VERSION: u32 = 13;
 
 /// Every schema step in order; index `n` takes a version-`n` database to
 /// version `n + 1`.
@@ -21,6 +21,7 @@ const MIGRATIONS: [Migration; DATABASE_SCHEMA_VERSION as usize] = [
     migrate_v10,
     migrate_v11,
     migrate_v12,
+    migrate_v13,
 ];
 
 /// Brings the database up to [`DATABASE_SCHEMA_VERSION`], one step per
@@ -666,6 +667,38 @@ fn migrate_v12(connection: &Connection) -> Result<(), StoreError> {
          END;
          CREATE INDEX mission_leads_mission_idx ON mission_leads(mission_id, created_at);
          PRAGMA user_version = 12;",
+    )?;
+    Ok(())
+}
+
+/// Drive policy is separate from Mission lifecycle. Approval receipts prevent
+/// a lead answer from being applied twice, including decision-only answers.
+fn migrate_v13(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE mission_drives (
+             mission_id TEXT PRIMARY KEY NOT NULL,
+             max_parallel INTEGER NOT NULL CHECK (max_parallel BETWEEN 1 AND 16),
+             policy_json TEXT NOT NULL,
+             pause_reason TEXT,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT
+         );
+         CREATE TABLE mission_lead_applications (
+             mission_id TEXT NOT NULL,
+             run_id TEXT NOT NULL,
+             stage_id TEXT NOT NULL,
+             answer_sha256 TEXT NOT NULL CHECK (length(answer_sha256) = 64),
+             applied_at TEXT NOT NULL,
+             PRIMARY KEY (mission_id, run_id, stage_id),
+             FOREIGN KEY (mission_id) REFERENCES missions(id) ON DELETE RESTRICT,
+             FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE RESTRICT
+         );
+         CREATE TRIGGER mission_lead_applications_immutable
+         BEFORE UPDATE ON mission_lead_applications
+         BEGIN
+             SELECT RAISE(ABORT, 'lead approval receipts are immutable');
+         END;
+         PRAGMA user_version = 13;",
     )?;
     Ok(())
 }

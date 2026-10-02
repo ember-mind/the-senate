@@ -59,6 +59,20 @@ pub enum StoreError {
         mission_id: MissionId,
         expected: u64,
     },
+    #[error("mission {mission_id} already has {limit} active runs; wait for one to finish")]
+    MissionDriveLimit { mission_id: MissionId, limit: usize },
+    #[error("mission {mission_id} already has an active lead run {run_id}")]
+    MissionLeadActive {
+        mission_id: MissionId,
+        run_id: RunId,
+    },
+    #[error("the mission or Consul answer changed; preview the plan again before approving")]
+    LeadProposalStale(MissionId),
+    #[error("mission {mission_id} already applied the proposals from {stage_id}")]
+    LeadProposalAlreadyApplied {
+        mission_id: MissionId,
+        stage_id: StageId,
+    },
     #[error("event {event_id} belongs to mission {actual}, not {expected}")]
     EventMissionMismatch {
         event_id: EventId,

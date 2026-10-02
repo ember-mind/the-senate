@@ -334,6 +334,14 @@ _Avoid_: Project, epic, swarm, session
 One engineering contract inside a mission — title, goal, why it exists, scope, acceptance criteria, verification expectations, delivering workflow — with a lifecycle of its own and at most one current child run. Its contract freezes once a run serves it.
 _Avoid_: Task, ticket, prompt, subtask
 
+**Mission drive**:
+An operator-started coordinator that advances a Mission's ready work packages within its drive policy. It suspends dispatch when human attention or source-checkout changes require a decision, without suspending or changing the child Runs on its own.
+_Avoid_: Mission lifecycle, automatic integration, daemon
+
+**Drive policy**:
+The Mission's reusable choice of maximum concurrent child Runs, execution selection and requested effort for future Runs. Each child Run retains its own immutable configuration.
+_Avoid_: Run configuration, live routing, global concurrency limit
+
 **Handoff**:
 The child run's immutable input rendered from canonical mission state: mission goal, package contract, integrated dependencies, and recorded decisions. Never typed by hand and never composed by an agent.
 _Avoid_: Prompt, brief, delegation message
@@ -361,6 +369,10 @@ _Avoid_: Context, history, transcript
 **Plan change**:
 One proposed operation on the plan (add, revise, cancel a package; record a decision) parsed from the lead answer's `## Plan changes` section. Proposed until `mission apply` lands it; a batch lands whole or not at all.
 _Avoid_: Suggestion, edit, patch
+
+**Plan approval**:
+The operator's acceptance of one previewed batch of Plan changes against the Mission and Lead answer they inspected. A changed Mission or Lead answer requires a fresh preview, and an accepted answer cannot be applied again.
+_Avoid_: Latest-answer apply, automatic proposal, integration
 
 **Mission decision**:
 An insert-only record of a design choice the plan rests on, with its rationale and author (user or lead). A reversed decision is a new decision.

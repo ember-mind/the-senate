@@ -257,8 +257,20 @@ fn open_browser(url: &str) {
 }
 
 /// Keep the lock file's inode: deleting it could let two processes lock
-/// different files with the same name. Closing the descriptor releases it.
-fn lock_instance(state_path: &Path) -> std::io::Result<std::fs::File> {
+/// different files with the same name.
+#[derive(Debug)]
+struct InstanceLock(std::fs::File);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Concurrent fork/exec may temporarily hold an inherited descriptor.
+        // Unlock explicitly instead of waiting for its last copy to close.
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+fn lock_instance(state_path: &Path) -> std::io::Result<InstanceLock> {
     if let Some(parent) = state_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -275,7 +287,7 @@ fn lock_instance(state_path: &Path) -> std::io::Result<std::fs::File> {
     let file = options.open(state_path.with_extension("lock"))?;
     #[cfg(unix)]
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-    Ok(file)
+    Ok(InstanceLock(file))
 }
 
 /// An already-running instance whose recorded port and token still answer

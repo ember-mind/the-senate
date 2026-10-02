@@ -790,7 +790,8 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UniformProvider {
     Claude,
     Codex,
@@ -868,7 +869,8 @@ impl RetryRoute {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutionSelection {
     Uniform(UniformProvider),
     /// Uniform routing pinned to one explicit model, every role.
@@ -892,7 +894,8 @@ pub enum ExecutionSelection {
 /// the operator overriding every role with one level — `NativeDefault`
 /// included, which is how a Recommended run opts out of the profile's
 /// policy. `PerRole` names some roles and leaves the rest to the profile.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffortRequest {
     #[default]
     ProfileDefault,

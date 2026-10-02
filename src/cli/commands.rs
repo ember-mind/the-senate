@@ -3,9 +3,9 @@ use clap::CommandFactory;
 
 use crate::app::{
     AppError, ApplyOutcome, BlockedDependencyRef, ExecutionReport, ExecutionSelection,
-    MissionDetails, MissionListItem, MissionService, NewWorkPackage, QuiescentState, RetryRoute,
-    Rework, RunDetails, RunService, RuntimeProviderFactory, StageDependencyRef,
-    StageWaitingSummary, UniformProvider, WorkPackageSummary,
+    MissionDetails, MissionDriveOptions, MissionListItem, MissionService, NewWorkPackage,
+    QuiescentState, RetryRoute, Rework, RunDetails, RunService, RuntimeProviderFactory,
+    StageDependencyRef, StageWaitingSummary, UniformProvider, WorkPackageSummary,
 };
 use crate::domain::{
     DecisionAuthor, DependencyOutcome, DomainEventKind, ModelId, StageStatus, WorkPackageContract,
@@ -816,6 +816,44 @@ fn mission(command: &MissionCommand) -> Result<()> {
             print_mission(&details);
             Ok(())
         }
+        MissionCommand::Drive {
+            mission_id,
+            max_parallel,
+            provider,
+            profile,
+            model,
+            effort,
+            once,
+        } => {
+            let selection = if provider.is_some() || profile.is_some() || model.is_some() {
+                execution_selection(provider.as_deref(), profile.as_deref(), model.as_deref())?
+            } else {
+                None
+            };
+            let effort = effort
+                .as_ref()
+                .map(|effort| parse_effort(Some(effort)))
+                .transpose()?;
+            let report = missions.drive_mission(
+                &service()?,
+                *mission_id,
+                MissionDriveOptions {
+                    max_parallel: *max_parallel,
+                    selection,
+                    effort,
+                    once: *once,
+                },
+            )?;
+            for run in &report.reports {
+                print_report(run);
+            }
+            println!(
+                "Mission drive: {} (maximum {} concurrent runs).",
+                report.reason, report.policy.max_parallel
+            );
+            print_mission(&report.details);
+            Ok(())
+        }
         MissionCommand::Attach {
             mission_id,
             package_id,
@@ -902,11 +940,12 @@ fn mission(command: &MissionCommand) -> Result<()> {
                     println!("The lead proposed no plan changes; nothing to apply.");
                     Ok(())
                 }
-                Ok(changes) => {
-                    for change in changes {
+                Ok(_) => {
+                    let preview = missions.preview_lead_proposals(*mission_id)?;
+                    for change in &preview.changes {
                         println!("  - {change}");
                     }
-                    let details = missions.apply_lead_proposals(*mission_id)?;
+                    let details = missions.approve_lead_proposals(&preview)?;
                     println!("Applied.");
                     print_mission(&details);
                     Ok(())

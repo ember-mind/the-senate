@@ -31,6 +31,10 @@ pub(crate) enum Intent {
     StartPackage,
     /// Record the selected delivered package as integrated.
     Integrate,
+    /// Compose a message to the selected Mission's Consul.
+    Consul,
+    /// Preview the latest Consul proposal batch before approving it.
+    PreviewPlan,
     Resume,
     Retry,
     Stop,
@@ -97,6 +101,8 @@ pub(crate) fn map_key(event: KeyEvent) -> Intent {
         KeyCode::Char('M') => Intent::Missions,
         KeyCode::Char('S') => Intent::StartPackage,
         KeyCode::Char('I') => Intent::Integrate,
+        KeyCode::Char('C') => Intent::Consul,
+        KeyCode::Char('p') => Intent::PreviewPlan,
         KeyCode::Char('W') => Intent::EnterSenate,
         KeyCode::Char('r') => Intent::Resume,
         KeyCode::Char('t') => Intent::Retry,

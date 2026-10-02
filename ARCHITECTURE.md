@@ -130,7 +130,7 @@ Mission (goal, packages, dependencies, decisions)      SQLite: missions / missio
 
 A mission is the durable plan several runs serve; a run stays the bounded engineering operation. The `Mission` aggregate owns its work packages exactly as `Run` owns its stages, so the invariants between packages — unique ids, acyclic dependencies, a package `Ready` only when every dependency is `Integrated`, run bound to at most one package, a `Blocked` or `Failed` package always carrying a reason, a `Completed` mission having integrated at least one package — are checked in one place, on every rehydration (`MissionSnapshotV1` → `MissionRehydrationData` → `Mission::rehydrate`) and before every commit. Persistence copies the run pattern: validated snapshot under compare-and-swap, a per-mission sequenced event log committed in the same transaction, an insert-only `mission_inputs` row for the immutable title, goal, repository and starting commit, and `mission_runs` as an indexed projection of the packages' run lists, synchronised inside the same transaction so a run traces up to its package without decoding every mission. A run a mission binds cannot be purged (`ON DELETE RESTRICT` plus `StoreError::RunBoundToMission`).
 
-Package state follows run evidence and nothing else. `MissionService` observes the committed status of every active package's current run on every read and mutation and reports it to the aggregate (`Mission::observe_run`): `NeedsUser` blocks, `Completed`/`Applied` delivers, `Failed`/`Discarded` fails, anything else is progress; repeating an observation yields no event. Integration is recorded on `IntegrationEvidence` read from the run store — the run is `Applied`, or it completed with an empty delta (the same delta apply and the diff preview compute) — never on a report. Integration preserves apply's no-stage/no-commit contract. The operator commits transferred changes before starting the next package; its worktree starts from committed HEAD, and a dirty Mission start refuses with a commit instruction before creating or binding a Run. Package readiness is dependency state, not Git cleanliness. Mission attention is derived from package state on every read and is not stored. The service never drives a run: `start_package` renders the handoff from canonical mission state (`handoff_task`: mission goal, contract, integrated dependencies, decisions) and starts an ordinary run through `RunService`, binding it to the package the moment `StartProgress::PreparingWorkspace` reports it persisted. Missions add no Git state, no routing state and no attention kind; a package chooses a workflow, and the child run resolves provider, model, effort, worktree and verification as any run does.
+Package state follows run evidence and nothing else. `MissionService` observes the committed status of every active package's current run on every read and mutation and reports it to the aggregate (`Mission::observe_run`): `NeedsUser` blocks, `Completed`/`Applied` delivers, `Failed`/`Discarded` fails, anything else is progress; repeating an observation yields no event. Integration is recorded on `IntegrationEvidence` read from the run store — the run is `Applied`, or it completed with an empty delta (the same delta apply and the diff preview compute) — never on a report. Integration preserves apply's no-stage/no-commit contract. The operator commits transferred changes before starting the next package; its worktree starts from committed HEAD, and a dirty Mission start refuses with a commit instruction before creating or binding a Run. Package readiness is dependency state, not Git cleanliness. Mission attention is derived from package state on every read and is not stored. Read paths never drive a Run. `mission drive` coordinates bounded ordinary Runs through `RunService`; `start_package` renders the handoff from canonical mission state (`handoff_task`: mission goal, contract, integrated dependencies, decisions) and starts an ordinary run through `RunService`, creating the Run, input, configuration, package binding and handoff atomically before workspace preparation. Missions add no Git state or attention kind; drive policy selects routing only for future Runs; a package chooses a workflow, and the child run resolves provider, model, effort, worktree and verification as any run does.
 
 Two records make the delegation checkable evidence rather than remembered text (M2). The **handoff** (`mission_handoffs`, schema v11, insert-only, one per run, committed in the same transaction as the bind) holds the hash of the contract the task was rendered from, the hash and size of the rendered task exactly as the run's immutable input stores it, and the dependencies and decisions it named; a run attached by hand has none. The **result** (`WorkPackageResult`, mission snapshot v2) is captured from the run store the first time a package's run is observed finished and kept with the package, so it outlives the worktree: changed files from the same bounded delta apply and the diff preview compute, the latest verify stage, every review stage and the latest decision with their committed statuses, and the editing, review and decision artifacts' own `## Bottom line` and `## Follow-ups` sections quoted verbatim through the integrity-verified artifact path. Nothing in it is composed. Rework rides the run's own fix and continue cycles: a delivered package whose run is at work again is in progress again, and one whose run finished with more stages than its result covers is re-delivered from a fresh capture, so a cycle started outside the mission is honoured too. `resume_mission` is the fan-in: it resumes every package run left prepared, running, paused or interrupted and then observes, which is how several packages started on native providers come home.
 
@@ -533,6 +533,8 @@ src/
 ├── app/
 │   ├── run_service.rs orchestration use cases and quiescence policy
 │   ├── mission_service.rs mission use cases, run observation, handoff rendering
+│   ├── mission_drive.rs bounded dispatch, persisted policy and restart recovery
+│   ├── mission_plan.rs validated Consul previews and explicit atomic approval
 │   ├── mission_result.rs delivery evidence captured from the run store
 │   ├── mission_query.rs mission read models
 │   ├── provider_factory.rs restart-stable provider construction
@@ -593,7 +595,8 @@ src/
 │   ├── migrations.rs SQLite schema lifecycle
 │   ├── config_snapshot.rs immutable config and canonical hash
 │   ├── image.rs     insert-only image-generation evidence rows
-│   ├── mission.rs   mission input, snapshot codec, event log, run index
+│   ├── mission.rs   mission input, snapshot codec, event log, atomic bindings/approval
+│   ├── mission_drive.rs drive policy and pause persistence
 │   ├── run_input.rs immutable normalized task input
 │   ├── process.rs   process lifecycle and output-cursor CAS persistence
 │   ├── provider.rs  provider-session/artifact persistence and atomic commits
@@ -633,7 +636,7 @@ src/
     ├── state.rs      ephemeral presentation state and composer editing
     ├── render.rs     Ratatui rendering and TestBackend coverage
     ├── input.rs      terminal key-to-intent mapping
-    ├── worker.rs     one serialized standard-thread action worker
+    ├── worker.rs     bounded action threads and per-Run claims
     ├── terminal.rs   raw-mode/alternate-screen RAII and panic restoration
     ├── bottom_line.rs artifact's own opening statement reduced to one line
     ├── follow_ups.rs decision's `## Follow-ups` section read verbatim
@@ -685,7 +688,7 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - Codex sandbox derives from stage kind and remains enabled with approval `never`; no prose heuristic creates human attention.
 - TUI is an ephemeral projection/control surface; canonical state and all execution remain below application boundary.
 - TUI read APIs are side-effect free: no reconciliation, output acknowledgement, apply intent, real-index mutation, or semantic event.
-- Blocking application actions are serialized on one standard thread; frontend detach never implies provider interruption or run disposition.
+- Blocking TUI application actions use worker threads, per-Run claims and a provider-work capacity guard; frontend detach does not discard or apply Runs. Explicit TUI quit stops the Running Runs it shows.
 - A mission is a plan above runs, not a new execution model: packages are delivered by ordinary runs, package state follows committed run status, and integration is recorded on run evidence (`Applied` or an empty delta), never on an agent's report.
 - Package readiness requires integrated dependencies, so a child run's base commit already carries what it builds on; a contract freezes once a run serves it.
 - opencode is explicit-only routing, never a Recommended candidate: its model id, not the provider, carries the vendor, so Recommended's per-runtime provenance has no concrete target to measure.
@@ -695,3 +698,9 @@ Domain operations are deterministic: callers supply UTC timestamps. Invalid tran
 - An unclean opencode process exit after a terminal step is never trusted as completion, because opencode has no second independently-written file to corroborate it against the way Codex's `--output-last-message` is.
 - `OPENCODE_CONFIG` is not opencode's enforcement authority: a repository can override it with its own `opencode.json`, verified to let a read-only run write a file. Every invocation also sets `OPENCODE_DISABLE_PROJECT_CONFIG=1` and `OPENCODE_PERMISSION=<permission JSON>`, the latter being the actual authority, plus `--pure` to keep repository/user plugin code from loading at all.
 - opencode checks a compound bash command per top-level sub-command, not as one string; a permission-halt approval therefore splits the denied command the same way and grants every part, failing closed (never guessing) when the split is uncertain.
+
+## Mission coordination and Consul approval
+
+`app::mission_drive` coordinates ordinary package Runs on bounded standard threads. SQLite stores reusable policy in `mission_drives`; existing Runs retain immutable configuration. A per-Mission advisory process lock releases on exit or crash. Run creation, input/config, Mission binding, handoff and active-cap check share one transaction; recovery can prepare a bound Created Run after a crash before workspace intent. Driver pauses new dispatch at dirty checkout, operator attention, failure or delivery awaiting explicit integration. It never stages, commits or integrates changes.
+
+Consul TUI chat dispatches through `MissionService::ask_lead`; draft and pending ticket belong to a Mission. `app::mission_plan` validates and renders a complete proposal batch, then pins Mission/Run revisions and answer evidence. Approval rechecks them and commits plan/events with an insert-only receipt in one transaction. Stale previews and repeated applications fail without partial changes. SQLite schema v13 adds policy and receipt storage; no Run snapshot or sealed config schema changes.

@@ -17,12 +17,14 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::{
     DecisionId, Mission, MissionDecision, MissionEvent, MissionEventKind, MissionId,
-    MissionRehydrationData, MissionStatus, RunId, WorkPackageContract, WorkPackageId,
+    MissionRehydrationData, MissionStatus, Run, RunId, StageId, WorkPackageContract, WorkPackageId,
     WorkPackageRehydrationData, WorkPackageResult, WorkPackageStatus,
 };
 
-use super::sqlite::{format_timestamp, i64_to_u64, parse_timestamp, u64_to_i64};
-use super::{SqliteStore, StoreError};
+use super::sqlite::{
+    CommitResult, RunRevision, format_timestamp, i64_to_u64, parse_timestamp, u64_to_i64,
+};
+use super::{ResolvedConfigSnapshot, RunInput, SqliteStore, StoreError};
 
 pub const MISSION_INPUT_SCHEMA_VERSION: u32 = 1;
 pub const MISSION_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
@@ -187,6 +189,17 @@ pub struct MissionHandoffRecord {
     pub dependencies: Vec<WorkPackageId>,
     pub decision_ids: Vec<DecisionId>,
     pub created_at: DateTime<Utc>,
+}
+
+/// The exact mission and lead answer revision a Plan Changes preview was
+/// approved against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadProposalApproval {
+    pub mission_revision: MissionRevision,
+    pub run_id: RunId,
+    pub run_revision: RunRevision,
+    pub stage_id: StageId,
+    pub answer_sha256: String,
 }
 
 /// SHA-256 of the contract's canonical (key-sorted, compact) JSON.
@@ -505,6 +518,73 @@ impl SqliteStore {
         Ok(summaries)
     }
 
+    /// Atomically creates a child Run, records its input and initial events,
+    /// and binds it with its handoff to a Mission package.
+    ///
+    /// # Errors
+    /// Any validation, stale-revision, drive-limit, or persistence failure
+    /// rolls back both the Run and Mission changes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one atomic run and mission commit"
+    )]
+    pub fn create_mission_run_with_input(
+        &mut self,
+        run: &Run,
+        input: &RunInput,
+        config: &ResolvedConfigSnapshot,
+        run_events: &[crate::domain::DomainEvent],
+        mission: &Mission,
+        expected_revision: MissionRevision,
+        mission_events: &[MissionEvent],
+        handoff: &MissionHandoffRecord,
+        auto_approve: bool,
+    ) -> Result<CommitResult, StoreError> {
+        if handoff.run_id != run.id() || handoff.mission_id != mission.id() {
+            return Err(StoreError::SnapshotProjectionMismatch(
+                "mission handoff identity differs from supplied run or mission",
+            ));
+        }
+        self.create_run_with_input_hook(run, input, config, run_events, |transaction| {
+            ensure_mission_drive_capacity(transaction, mission.id())?;
+            commit_mission_update_in_transaction(
+                transaction,
+                mission,
+                expected_revision,
+                mission_events,
+                Some(handoff),
+            )?;
+            if auto_approve {
+                transaction.execute(
+                    "UPDATE runs SET auto_approve = 1 WHERE id = ?1",
+                    [run.id().to_string()],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Atomically creates and binds a Mission's initial Consul lead Run.
+    /// A current lead may be replaced only after its Run is Failed or
+    /// Discarded; a concurrent caller cannot create a second active lead.
+    ///
+    /// # Errors
+    /// Returns validation, active-lead, or persistence errors. Failure rolls
+    /// back the Run, input, config, and events together.
+    pub fn create_mission_lead_run_with_input(
+        &mut self,
+        run: &Run,
+        input: &RunInput,
+        config: &ResolvedConfigSnapshot,
+        events: &[crate::domain::DomainEvent],
+        mission_id: MissionId,
+        created_at: DateTime<Utc>,
+    ) -> Result<CommitResult, StoreError> {
+        self.create_run_with_input_hook(run, input, config, events, |transaction| {
+            bind_mission_lead_in_transaction(transaction, mission_id, run.id(), &created_at)
+        })
+    }
+
     /// Atomically updates the snapshot, appends its event batch, and keeps
     /// the run index in step, using compare-and-swap on the revision.
     ///
@@ -534,73 +614,124 @@ impl SqliteStore {
         events: &[MissionEvent],
         handoff: Option<&MissionHandoffRecord>,
     ) -> Result<MissionRevision, StoreError> {
-        mission.validate_invariants()?;
-        if let Some(handoff) = handoff {
-            let bound = mission
-                .package(&handoff.package_id)
-                .is_some_and(|package| package.runs().contains(&handoff.run_id));
-            if handoff.mission_id != mission.id() || !bound {
-                return Err(StoreError::SnapshotProjectionMismatch(
-                    "handoff names a run the mission does not bind",
-                ));
-            }
-        }
-        let snapshot_json = encode_mission(mission)?;
-        let status = status_text(mission.status())?;
-        let next_revision = expected_revision
-            .value()
-            .checked_add(1)
-            .ok_or(StoreError::IntegerRange("next mission revision"))?;
-        if events
-            .iter()
-            .any(|event| matches!(event.kind(), MissionEventKind::MissionCreated))
-        {
-            return Err(StoreError::UnexpectedRunCreatedEvent);
-        }
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row = load_mission_row(&transaction, mission.id())?;
-        let current = decode_mission(&row.snapshot_json, row.snapshot_schema_version)?;
-        if current.created_at() != mission.created_at() {
-            return Err(StoreError::ImmutableRunFieldChanged("mission created_at"));
-        }
-        let last_occurred_at = last_mission_event(&transaction, mission.id())?;
-        validate_mission_events(mission, events, last_occurred_at.map(|(_, at)| at))?;
-
-        let changed = transaction.execute(
-            "UPDATE missions
-             SET status = ?1, snapshot_schema_version = ?2, snapshot_json = ?3,
-                 revision = ?4, updated_at = ?5
-             WHERE id = ?6 AND revision = ?7",
-            params![
-                status,
-                i64::from(MISSION_SNAPSHOT_SCHEMA_VERSION),
-                snapshot_json,
-                u64_to_i64(next_revision, "next mission revision")?,
-                format_timestamp(mission.updated_at()),
-                mission.id().to_string(),
-                u64_to_i64(expected_revision.value(), "expected mission revision")?,
-            ],
+        let revision = commit_mission_update_in_transaction(
+            &transaction,
+            mission,
+            expected_revision,
+            events,
+            handoff,
         )?;
-        if changed == 0 {
-            return Err(StoreError::MissionConcurrentModification {
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    /// Applies a lead proposal only while the Mission and lead Run remain at
+    /// the revisions shown by the preview, and stores a receipt atomically.
+    ///
+    /// # Errors
+    /// Returns `LeadProposalAlreadyApplied` on replay and
+    /// `LeadProposalStale` if either revision or the lead binding changed.
+    pub fn commit_mission_plan_approval(
+        &mut self,
+        mission: &Mission,
+        mission_events: &[MissionEvent],
+        approval: &LeadProposalApproval,
+        applied_at: DateTime<Utc>,
+    ) -> Result<MissionRevision, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let already_applied: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mission_lead_applications
+                 WHERE mission_id = ?1 AND run_id = ?2 AND stage_id = ?3
+             )",
+            params![
+                mission.id().to_string(),
+                approval.run_id.to_string(),
+                approval.stage_id.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if already_applied {
+            return Err(StoreError::LeadProposalAlreadyApplied {
                 mission_id: mission.id(),
-                expected: expected_revision.value(),
+                stage_id: approval.stage_id.clone(),
             });
         }
-        let first_sequence = last_occurred_at
-            .map_or(0, |(sequence, _)| sequence)
-            .checked_add(1)
-            .ok_or(StoreError::IntegerRange("next mission event sequence"))?;
-        insert_mission_events(&transaction, mission, events, first_sequence)?;
-        sync_mission_runs(&transaction, mission)?;
-        if let Some(handoff) = handoff {
-            insert_handoff(&transaction, handoff)?;
+
+        let mission_revision = load_mission_row(&transaction, mission.id())?.revision;
+        let run_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM runs WHERE id = ?1",
+                [approval.run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let lead_bound: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mission_leads WHERE mission_id = ?1 AND run_id = ?2
+             )",
+            params![mission.id().to_string(), approval.run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let run_is_current = run_revision
+            .map(|revision| i64_to_u64(revision, "run revision"))
+            .transpose()?
+            .is_some_and(|revision| revision == approval.run_revision.value());
+        if mission_revision != approval.mission_revision.value() || !run_is_current || !lead_bound {
+            return Err(StoreError::LeadProposalStale(mission.id()));
         }
+
+        let revision = commit_mission_update_in_transaction(
+            &transaction,
+            mission,
+            approval.mission_revision,
+            mission_events,
+            None,
+        )?;
+        transaction.execute(
+            "INSERT INTO mission_lead_applications (
+                 mission_id, run_id, stage_id, answer_sha256, applied_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                mission.id().to_string(),
+                approval.run_id.to_string(),
+                approval.stage_id.as_str(),
+                approval.answer_sha256,
+                format_timestamp(&applied_at),
+            ],
+        )?;
         transaction.commit()?;
-        Ok(MissionRevision(next_revision))
+        Ok(revision)
+    }
+
+    /// Whether a lead stage's Plan Changes have already been approved.
+    ///
+    /// # Errors
+    /// Returns `SQLite` query errors.
+    pub fn lead_proposals_applied(
+        &self,
+        mission_id: MissionId,
+        run_id: RunId,
+        stage_id: &StageId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM mission_lead_applications
+                 WHERE mission_id = ?1 AND run_id = ?2 AND stage_id = ?3
+             )",
+            params![
+                mission_id.to_string(),
+                run_id.to_string(),
+                stage_id.as_str()
+            ],
+            |row| row.get(0),
+        )?)
     }
 
     /// Every handoff recorded for one mission, oldest first.
@@ -770,6 +901,157 @@ impl SqliteStore {
     pub fn mission_of_lead_run(&self, run_id: RunId) -> Result<Option<MissionId>, StoreError> {
         mission_of_lead_run(&self.connection, run_id)
     }
+}
+
+fn commit_mission_update_in_transaction(
+    transaction: &Transaction<'_>,
+    mission: &Mission,
+    expected_revision: MissionRevision,
+    events: &[MissionEvent],
+    handoff: Option<&MissionHandoffRecord>,
+) -> Result<MissionRevision, StoreError> {
+    mission.validate_invariants()?;
+    if let Some(handoff) = handoff {
+        let bound = mission
+            .package(&handoff.package_id)
+            .is_some_and(|package| package.runs().contains(&handoff.run_id));
+        if handoff.mission_id != mission.id() || !bound {
+            return Err(StoreError::SnapshotProjectionMismatch(
+                "handoff names a run the mission does not bind",
+            ));
+        }
+    }
+    let snapshot_json = encode_mission(mission)?;
+    let status = status_text(mission.status())?;
+    let next_revision = expected_revision
+        .value()
+        .checked_add(1)
+        .ok_or(StoreError::IntegerRange("next mission revision"))?;
+    if events
+        .iter()
+        .any(|event| matches!(event.kind(), MissionEventKind::MissionCreated))
+    {
+        return Err(StoreError::UnexpectedRunCreatedEvent);
+    }
+
+    let row = load_mission_row(transaction, mission.id())?;
+    let current = decode_mission(&row.snapshot_json, row.snapshot_schema_version)?;
+    if current.created_at() != mission.created_at() {
+        return Err(StoreError::ImmutableRunFieldChanged("mission created_at"));
+    }
+    let last_occurred_at = last_mission_event(transaction, mission.id())?;
+    validate_mission_events(mission, events, last_occurred_at.map(|(_, at)| at))?;
+
+    let changed = transaction.execute(
+        "UPDATE missions
+         SET status = ?1, snapshot_schema_version = ?2, snapshot_json = ?3,
+             revision = ?4, updated_at = ?5
+         WHERE id = ?6 AND revision = ?7",
+        params![
+            status,
+            i64::from(MISSION_SNAPSHOT_SCHEMA_VERSION),
+            snapshot_json,
+            u64_to_i64(next_revision, "next mission revision")?,
+            format_timestamp(mission.updated_at()),
+            mission.id().to_string(),
+            u64_to_i64(expected_revision.value(), "expected mission revision")?,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(StoreError::MissionConcurrentModification {
+            mission_id: mission.id(),
+            expected: expected_revision.value(),
+        });
+    }
+    let first_sequence = last_occurred_at
+        .map_or(0, |(sequence, _)| sequence)
+        .checked_add(1)
+        .ok_or(StoreError::IntegerRange("next mission event sequence"))?;
+    insert_mission_events(transaction, mission, events, first_sequence)?;
+    sync_mission_runs(transaction, mission)?;
+    if let Some(handoff) = handoff {
+        insert_handoff(transaction, handoff)?;
+    }
+    Ok(MissionRevision(next_revision))
+}
+
+fn ensure_mission_drive_capacity(
+    transaction: &Transaction<'_>,
+    mission_id: MissionId,
+) -> Result<(), StoreError> {
+    let configured_limit: Option<i64> = transaction
+        .query_row(
+            "SELECT max_parallel FROM mission_drives WHERE mission_id = ?1",
+            [mission_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(configured_limit) = configured_limit else {
+        return Ok(());
+    };
+    let limit = usize::try_from(configured_limit)
+        .map_err(|_| StoreError::IntegerRange("mission drive max_parallel"))?;
+    let active: i64 = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM mission_runs AS bindings
+         JOIN runs ON runs.id = bindings.run_id
+         WHERE bindings.mission_id = ?1
+           AND runs.status IN (
+               'created', 'preparing', 'ready', 'running', 'needs_user', 'paused', 'interrupted'
+           )",
+        [mission_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(active).map_err(|_| StoreError::IntegerRange("active mission runs"))?
+        >= limit
+    {
+        return Err(StoreError::MissionDriveLimit { mission_id, limit });
+    }
+    Ok(())
+}
+
+fn bind_mission_lead_in_transaction(
+    transaction: &Transaction<'_>,
+    mission_id: MissionId,
+    run_id: RunId,
+    created_at: &DateTime<Utc>,
+) -> Result<(), StoreError> {
+    if !mission_exists(transaction, mission_id)? {
+        return Err(StoreError::MissionNotFound(mission_id));
+    }
+    let current: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT leads.run_id, runs.status
+             FROM mission_leads AS leads
+             JOIN runs ON runs.id = leads.run_id
+             WHERE leads.mission_id = ?1
+             ORDER BY leads.created_at DESC, leads.rowid DESC
+             LIMIT 1",
+            [mission_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((current_run, status)) = current
+        && status != "failed"
+        && status != "discarded"
+    {
+        let current_run = current_run
+            .parse()
+            .map_err(|_| StoreError::SnapshotProjectionMismatch("run ID"))?;
+        return Err(StoreError::MissionLeadActive {
+            mission_id,
+            run_id: current_run,
+        });
+    }
+    transaction.execute(
+        "INSERT INTO mission_leads (run_id, mission_id, created_at) VALUES (?1, ?2, ?3)",
+        params![
+            run_id.to_string(),
+            mission_id.to_string(),
+            format_timestamp(created_at)
+        ],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn mission_of_lead_run(
@@ -1083,7 +1365,7 @@ mod tests {
     use super::*;
     use crate::domain::{
         ConfigSnapshotId, DecisionAuthor, DecisionId, DomainEvent, DomainEventKind, EventId,
-        EventMetadata, Run, RunStatus, WorkflowDefinition, WorkflowKind,
+        EventMetadata, Run, RunStatus, RunTransition, WorkflowDefinition, WorkflowKind,
     };
     use crate::store::{ResolvedConfigSnapshot, RunInput};
 
@@ -1145,6 +1427,55 @@ mod tests {
             .create_run_with_input(&run, &input, &config, &[event])
             .unwrap();
         run
+    }
+
+    fn run_parts(
+        run_id: RunId,
+        config_id: &str,
+    ) -> (Run, RunInput, ResolvedConfigSnapshot, Vec<DomainEvent>) {
+        let config = ResolvedConfigSnapshot::new(
+            ConfigSnapshotId::new(config_id).unwrap(),
+            1,
+            serde_json::json!({"provider": "fake"}),
+            at(0),
+        )
+        .unwrap();
+        let run = Run::new(
+            run_id,
+            WorkflowDefinition::built_in(WorkflowKind::Fast),
+            config.id().clone(),
+            at(0),
+        );
+        let input = RunInput::new(run_id, "task", at(0)).unwrap();
+        let event = DomainEvent::new(
+            EventMetadata::new(EventId::new(), at(0)),
+            run_id,
+            None,
+            DomainEventKind::RunCreated {
+                workflow: WorkflowKind::Fast,
+            },
+        );
+        (run, input, config, vec![event])
+    }
+
+    fn handoff(
+        run_id: RunId,
+        mission_id: MissionId,
+        package_id: WorkPackageId,
+    ) -> MissionHandoffRecord {
+        let title = package_id.as_str().to_ascii_uppercase();
+        let contract = contract(&title);
+        MissionHandoffRecord {
+            run_id,
+            mission_id,
+            package_id,
+            contract_sha256: contract_sha256(&contract).unwrap(),
+            task_sha256: sha256_hex(b"task"),
+            task_size: 4,
+            dependencies: vec![],
+            decision_ids: vec![],
+            created_at: at(2),
+        }
     }
 
     #[test]
@@ -1300,6 +1631,58 @@ mod tests {
     }
 
     #[test]
+    fn initial_lead_run_and_binding_are_atomic_and_only_one_active_lead_is_allowed() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mission, _, _) = new_mission(&mut store);
+        let first_id = RunId::from_u128(80);
+        let (first, first_input, first_config, first_events) = run_parts(first_id, "lead-first");
+        store
+            .create_mission_lead_run_with_input(
+                &first,
+                &first_input,
+                &first_config,
+                &first_events,
+                mission.id(),
+                at(1),
+            )
+            .unwrap();
+        assert_eq!(
+            store.mission_lead(mission.id()).unwrap().unwrap().run_id,
+            first_id
+        );
+        assert_eq!(store.load_run_input(first_id).unwrap(), Some(first_input));
+
+        let second_id = RunId::from_u128(81);
+        let (second, second_input, second_config, second_events) =
+            run_parts(second_id, "lead-second");
+        assert!(matches!(
+            store.create_mission_lead_run_with_input(
+                &second,
+                &second_input,
+                &second_config,
+                &second_events,
+                mission.id(),
+                at(2),
+            ),
+            Err(StoreError::MissionLeadActive { mission_id, run_id })
+                if mission_id == mission.id() && run_id == first_id
+        ));
+        assert!(matches!(
+            store.load_run(second_id),
+            Err(StoreError::RunNotFound(id)) if id == second_id
+        ));
+        assert!(store.load_run_input(second_id).unwrap().is_none());
+        assert!(matches!(
+            store.load_config_snapshot(second_config.id()),
+            Err(StoreError::ConfigSnapshotNotFound(_))
+        ));
+        assert_eq!(
+            store.mission_lead(mission.id()).unwrap().unwrap().run_id,
+            first_id
+        );
+    }
+
+    #[test]
     fn a_handoff_commits_with_the_bind_and_never_for_a_run_the_mission_lacks() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let run_id = RunId::from_u128(7);
@@ -1344,6 +1727,403 @@ mod tests {
         assert_ne!(
             contract_sha256(&contract("A")).unwrap(),
             contract_sha256(&contract("B")).unwrap()
+        );
+    }
+
+    #[test]
+    fn atomic_mission_run_creation_rolls_back_on_stale_revision() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mut mission, _, revision) = new_mission(&mut store);
+        let change = mission
+            .add_package(package("a"), contract("A"), vec![], at(1))
+            .unwrap();
+        let revision = store
+            .commit_mission_update(&mission, revision, &change.events)
+            .unwrap();
+        let run_id = RunId::from_u128(70);
+        let (run, input, config, run_events) = run_parts(run_id, "atomic-stale");
+        let change = mission.start_package(&package("a"), run_id, at(2)).unwrap();
+        let handoff = handoff(run_id, mission.id(), package("a"));
+
+        let error = store
+            .create_mission_run_with_input(
+                &run,
+                &input,
+                &config,
+                &run_events,
+                &mission,
+                MissionRevision::initial(),
+                &change.events,
+                &handoff,
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::MissionConcurrentModification { expected: 0, .. }
+        ));
+        assert_eq!(store.load_mission(mission.id()).unwrap().revision, revision);
+        assert!(matches!(
+            store.load_run(run_id),
+            Err(StoreError::RunNotFound(id)) if id == run_id
+        ));
+        assert!(store.load_run_input(run_id).unwrap().is_none());
+        assert!(matches!(
+            store.load_config_snapshot(config.id()),
+            Err(StoreError::ConfigSnapshotNotFound(_))
+        ));
+        assert!(store.mission_of_run(run_id).unwrap().is_none());
+        assert!(
+            store
+                .list_mission_handoffs(mission.id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mission_run_creation_enforces_drive_limit_and_binds_everything_together() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mut mission, _, revision) = new_mission(&mut store);
+        let mut events = mission
+            .add_package(package("a"), contract("A"), vec![], at(1))
+            .unwrap()
+            .events;
+        events.extend(
+            mission
+                .add_package(package("b"), contract("B"), vec![], at(1))
+                .unwrap()
+                .events,
+        );
+        let revision = store
+            .commit_mission_update(&mission, revision, &events)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO mission_drives (
+                     mission_id, max_parallel, policy_json, pause_reason, updated_at
+                 ) VALUES (?1, 1, '{}', NULL, ?2)",
+                params![mission.id().to_string(), format_timestamp(&at(1))],
+            )
+            .unwrap();
+
+        let first_id = RunId::from_u128(71);
+        let (first, first_input, first_config, first_events) = run_parts(first_id, "drive-first");
+        let first_change = mission
+            .start_package(&package("a"), first_id, at(2))
+            .unwrap();
+        let first_handoff = handoff(first_id, mission.id(), package("a"));
+        store
+            .create_mission_run_with_input(
+                &first,
+                &first_input,
+                &first_config,
+                &first_events,
+                &mission,
+                revision,
+                &first_change.events,
+                &first_handoff,
+                true,
+            )
+            .unwrap();
+        assert!(store.run_auto_approve(first_id).unwrap());
+        assert_eq!(
+            store.mission_of_run(first_id).unwrap().unwrap().package_id,
+            package("a")
+        );
+        assert_eq!(
+            store.list_mission_handoffs(mission.id()).unwrap(),
+            vec![first_handoff.clone()]
+        );
+
+        let loaded = store.load_mission(mission.id()).unwrap();
+        let mut second_mission = loaded.mission;
+        let second_revision = loaded.revision;
+        let second_id = RunId::from_u128(72);
+        let (second, second_input, second_config, second_events) =
+            run_parts(second_id, "drive-second");
+        let second_change = second_mission
+            .start_package(&package("b"), second_id, at(3))
+            .unwrap();
+        let second_handoff = handoff(second_id, mission.id(), package("b"));
+        assert!(matches!(
+            store.create_mission_run_with_input(
+                &second,
+                &second_input,
+                &second_config,
+                &second_events,
+                &second_mission,
+                second_revision,
+                &second_change.events,
+                &second_handoff,
+                false,
+            ),
+            Err(StoreError::MissionDriveLimit { limit: 1, .. })
+        ));
+        assert!(matches!(
+            store.load_run(second_id),
+            Err(StoreError::RunNotFound(id)) if id == second_id
+        ));
+        assert!(store.mission_of_run(second_id).unwrap().is_none());
+        assert_eq!(
+            store.load_mission(mission.id()).unwrap().revision,
+            second_revision
+        );
+        assert_eq!(
+            store.list_mission_handoffs(mission.id()).unwrap(),
+            vec![first_handoff]
+        );
+    }
+
+    #[test]
+    fn failed_auto_approval_write_rolls_back_run_binding_and_handoff() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mut mission, _, revision) = new_mission(&mut store);
+        let change = mission
+            .add_package(package("a"), contract("A"), vec![], at(1))
+            .unwrap();
+        let revision = store
+            .commit_mission_update(&mission, revision, &change.events)
+            .unwrap();
+        let run_id = RunId::from_u128(73);
+        let (run, input, config, run_events) = run_parts(run_id, "atomic-auto-approve");
+        let change = mission.start_package(&package("a"), run_id, at(2)).unwrap();
+        let handoff = handoff(run_id, mission.id(), package("a"));
+        store.connection.execute_batch("CREATE TEMP TRIGGER fail_auto_approve BEFORE UPDATE OF auto_approve ON runs BEGIN SELECT RAISE(ABORT, 'injected auto-approve failure'); END;").unwrap();
+        let refused = store.create_mission_run_with_input(
+            &run,
+            &input,
+            &config,
+            &run_events,
+            &mission,
+            revision,
+            &change.events,
+            &handoff,
+            true,
+        );
+        assert!(matches!(refused, Err(StoreError::Sqlite(_))));
+        assert!(matches!(
+            store.load_run(run_id),
+            Err(StoreError::RunNotFound(_))
+        ));
+        assert!(store.load_run_input(run_id).unwrap().is_none());
+        assert!(store.mission_of_run(run_id).unwrap().is_none());
+        assert!(
+            store
+                .list_mission_handoffs(mission.id())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.load_mission(mission.id()).unwrap().revision, revision);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_auto_approve;")
+            .unwrap();
+        store
+            .create_mission_run_with_input(
+                &run,
+                &input,
+                &config,
+                &run_events,
+                &mission,
+                revision,
+                &change.events,
+                &handoff,
+                true,
+            )
+            .unwrap();
+        assert!(store.run_auto_approve(run_id).unwrap());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one approval transaction sequence and rollback assertions"
+    )]
+    fn plan_approval_receipt_is_atomic_idempotency_guard_and_rejects_stale_preview() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mut mission, _, revision) = new_mission(&mut store);
+        let lead_id = RunId::from_u128(73);
+        create_run(&mut store, lead_id);
+        store
+            .bind_mission_lead(mission.id(), lead_id, &at(0))
+            .unwrap();
+        let approval = LeadProposalApproval {
+            mission_revision: revision,
+            run_id: lead_id,
+            run_revision: RunRevision::initial(),
+            stage_id: StageId::new("lead_plan").unwrap(),
+            answer_sha256: sha256_hex(b"proposal"),
+        };
+        let first_change = mission
+            .record_decision(
+                DecisionId::from_u128(74),
+                "Approved direction",
+                "Matches the agreed scope",
+                DecisionAuthor::User,
+                at(1),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_mission_plan_approval(&mission, &first_change.events, &approval, at(2))
+                .unwrap()
+                .value(),
+            1
+        );
+        assert!(
+            store
+                .lead_proposals_applied(mission.id(), lead_id, &approval.stage_id)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.commit_mission_plan_approval(&mission, &first_change.events, &approval, at(3)),
+            Err(StoreError::LeadProposalAlreadyApplied { .. })
+        ));
+
+        let stale_approval = LeadProposalApproval {
+            stage_id: StageId::new("another_lead_plan").unwrap(),
+            ..approval
+        };
+        let stale_change = mission
+            .record_decision(
+                DecisionId::from_u128(75),
+                "Another change",
+                "Would make the preview stale",
+                DecisionAuthor::User,
+                at(4),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit_mission_plan_approval(
+                &mission,
+                &stale_change.events,
+                &stale_approval,
+                at(5)
+            ),
+            Err(StoreError::LeadProposalStale(id)) if id == mission.id()
+        ));
+        assert_eq!(
+            store.load_mission(mission.id()).unwrap().revision.value(),
+            1
+        );
+        assert_eq!(store.load_mission_events(mission.id()).unwrap().len(), 2);
+        let receipts: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM mission_lead_applications WHERE mission_id = ?1",
+                [mission.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 1);
+
+        let mut next_candidate = store.load_mission(mission.id()).unwrap().mission;
+        let next_change = next_candidate
+            .record_decision(
+                DecisionId::from_u128(76),
+                "Receipt transaction",
+                "Its failure must roll back the decision too",
+                DecisionAuthor::User,
+                at(6),
+            )
+            .unwrap();
+        let next_approval = LeadProposalApproval {
+            mission_revision: MissionRevision(1),
+            run_id: lead_id,
+            run_revision: RunRevision::initial(),
+            stage_id: StageId::new("receipt_failure").unwrap(),
+            answer_sha256: sha256_hex(b"receipt failure proposal"),
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER senate_test_fail_lead_receipt
+                 BEFORE INSERT ON mission_lead_applications
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected lead receipt failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .commit_mission_plan_approval(
+                    &next_candidate,
+                    &next_change.events,
+                    &next_approval,
+                    at(7)
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER senate_test_fail_lead_receipt;")
+            .unwrap();
+        assert_eq!(
+            store.load_mission(mission.id()).unwrap().revision.value(),
+            1
+        );
+        assert_eq!(store.load_mission_events(mission.id()).unwrap().len(), 2);
+        assert!(
+            !store
+                .lead_proposals_applied(mission.id(), lead_id, &next_approval.stage_id)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn plan_approval_rejects_a_lead_run_that_advanced_after_preview() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let (mut mission, _, mission_revision) = new_mission(&mut store);
+        let lead_id = RunId::from_u128(82);
+        create_run(&mut store, lead_id);
+        store
+            .bind_mission_lead(mission.id(), lead_id, &at(0))
+            .unwrap();
+        let loaded_run = store.load_run(lead_id).unwrap();
+        let mut advanced_run = loaded_run.run;
+        let event = advanced_run
+            .transition(
+                RunTransition::BeginPreparation,
+                EventMetadata::new(EventId::new(), at(1)),
+            )
+            .unwrap();
+        let new_run_revision = store
+            .commit_run_update(&advanced_run, loaded_run.revision, &[event])
+            .unwrap()
+            .revision();
+
+        let change = mission
+            .record_decision(
+                DecisionId::from_u128(83),
+                "Stale lead turn",
+                "The lead advanced while this preview was open",
+                DecisionAuthor::User,
+                at(2),
+            )
+            .unwrap();
+        let approval = LeadProposalApproval {
+            mission_revision,
+            run_id: lead_id,
+            run_revision: RunRevision::initial(),
+            stage_id: StageId::new("lead_plan").unwrap(),
+            answer_sha256: sha256_hex(b"old answer"),
+        };
+        assert_ne!(new_run_revision, approval.run_revision);
+        assert!(matches!(
+            store.commit_mission_plan_approval(&mission, &change.events, &approval, at(3)),
+            Err(StoreError::LeadProposalStale(id)) if id == mission.id()
+        ));
+        assert_eq!(
+            store.load_mission(mission.id()).unwrap().revision,
+            mission_revision
+        );
+        assert_eq!(store.load_mission_events(mission.id()).unwrap().len(), 1);
+        assert!(
+            !store
+                .lead_proposals_applied(mission.id(), lead_id, &approval.stage_id)
+                .unwrap()
         );
     }
 

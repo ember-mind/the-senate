@@ -14,6 +14,14 @@ use super::RoutingError;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("mission {0} is already being driven by another process")]
+    MissionDriveBusy(crate::domain::MissionId),
+    #[error("mission drive concurrency must be between 1 and 16, got {0}")]
+    InvalidMissionDriveLimit(usize),
+    #[error("mission drive is unavailable: {0}")]
+    MissionDriveUnavailable(String),
+    #[error("the Consul proposed no plan changes for mission {0}")]
+    NoLeadProposals(crate::domain::MissionId),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

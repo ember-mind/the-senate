@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyEventKind};
 
 use crate::app::{
-    AppError, ArtifactSummary, MissionService, RunListItem, RunService, RuntimeProviderFactory,
-    StartProgress,
+    AppError, ArtifactSummary, LeadAnswer, MissionService, RunListItem, RunService,
+    RuntimeProviderFactory, StartProgress,
 };
 use crate::domain::{MissionId, RunId, RunStatus, StageId, StageStatus, WorkPackageStatus};
 use crate::update::{InstallSource, UpdateInfo};
@@ -18,8 +18,8 @@ use super::input::{self, Intent, map_key, map_text_key};
 use super::motion;
 use super::render;
 use super::state::{
-    CycleChoice, Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice, Screen, StageHeadline,
-    StartFailure, StartInFlight, TuiState, UiMessageKind,
+    ConsulAskInFlight, CycleChoice, Overlay, PublishInFlight, PublishOutcome, RetryRouteChoice,
+    Screen, StageHeadline, StartFailure, StartInFlight, TuiState, UiMessageKind,
 };
 use super::terminal::TerminalSession;
 use super::worker::ActionKind;
@@ -211,7 +211,7 @@ impl TuiApp {
                     && matches!(self.state.new_run.focus, 0 | 2)
                     || matches!(
                         self.state.overlay,
-                        Some(Overlay::Attention | Overlay::Continue)
+                        Some(Overlay::Attention | Overlay::Continue | Overlay::ConsulChat)
                     );
                 let intent = if text_mode {
                     map_text_key(key)
@@ -325,6 +325,10 @@ impl TuiApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one dispatch table for overlay intents"
+    )]
     fn handle_overlay_intent(&mut self, overlay: Overlay, intent: Intent) {
         if overlay == Overlay::Update {
             self.handle_update_intent(intent);
@@ -343,11 +347,24 @@ impl TuiApp {
             return;
         }
         if matches!(intent, Intent::Escape | Intent::Help) {
-            self.state.overlay = None;
+            match overlay {
+                Overlay::ConsulChat => self.close_consul_chat(),
+                Overlay::PlanConfirm if self.state.lead_plan_pending_ticket.is_some() => {
+                    self.state.overlay = None;
+                }
+                Overlay::PlanConfirm => {
+                    self.state.overlay = None;
+                    self.state.lead_plan_preview = None;
+                    self.state.lead_plan_scroll = 0;
+                }
+                _ => self.state.overlay = None,
+            }
             return;
         }
         match overlay {
             Overlay::Attention => self.handle_attention_intent(intent),
+            Overlay::ConsulChat => self.handle_consul_chat_intent(intent),
+            Overlay::PlanConfirm => self.handle_plan_confirm_intent(intent),
             Overlay::Continue => self.handle_continue_intent(intent),
             Overlay::FollowUps => self.handle_follow_ups_intent(intent),
             Overlay::NextCycle => self.handle_next_cycle_intent(intent),
@@ -586,6 +603,213 @@ impl TuiApp {
         }
     }
 
+    /// Opens the Consul composer for the selected Mission without taking the
+    /// Mission identity from a later selection or worker response.
+    fn open_consul_chat(&mut self) {
+        let Some(mission_id) = self.state.selected_mission else {
+            return;
+        };
+        if self
+            .state
+            .mission
+            .as_ref()
+            .is_none_or(|mission| mission.id != mission_id)
+        {
+            self.state.notify(
+                UiMessageKind::Info,
+                "Wait for the selected Mission to load before messaging its Consul.".to_owned(),
+            );
+            return;
+        }
+        self.state.consul_drafts.entry(mission_id).or_default();
+        self.state.consul_chat_mission = Some(mission_id);
+        self.state.overlay = Some(Overlay::ConsulChat);
+    }
+
+    /// Leaves the draft in its Mission-scoped slot so opening another
+    /// campaign never inherits these words.
+    fn close_consul_chat(&mut self) {
+        self.state.overlay = None;
+        self.state.consul_chat_mission = None;
+    }
+
+    fn handle_consul_chat_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Left => self.edit_consul_draft(super::state::TextField::left),
+            Intent::Right => self.edit_consul_draft(super::state::TextField::right),
+            Intent::Home => self.edit_consul_draft(super::state::TextField::home),
+            Intent::End => self.edit_consul_draft(super::state::TextField::end),
+            Intent::Backspace => self.edit_consul_draft(super::state::TextField::backspace),
+            Intent::Delete => self.edit_consul_draft(super::state::TextField::delete),
+            Intent::DeleteToStart => {
+                self.edit_consul_draft(super::state::TextField::delete_to_start);
+            }
+            Intent::DeleteToEnd => self.edit_consul_draft(super::state::TextField::delete_to_end),
+            Intent::DeleteWordBefore => {
+                self.edit_consul_draft(super::state::TextField::delete_word_before);
+            }
+            Intent::Character(character) => {
+                self.edit_consul_draft(|field| field.insert(character));
+            }
+            Intent::Enter => self.submit_consul_message(),
+            _ => {}
+        }
+    }
+
+    fn consul_draft_mut(&mut self) -> Option<&mut super::state::TextField> {
+        let mission_id = self.state.consul_chat_mission?;
+        Some(self.state.consul_drafts.entry(mission_id).or_default())
+    }
+
+    fn edit_consul_draft(&mut self, edit: impl FnOnce(&mut super::state::TextField)) {
+        if let Some(field) = self.consul_draft_mut() {
+            edit(field);
+        }
+    }
+
+    /// Sends one Mission-scoped Consul turn to the worker. A durable lead
+    /// awaiting the operator must be resumed through its run attention first.
+    fn submit_consul_message(&mut self) {
+        let Some(mission_id) = self.state.consul_chat_mission else {
+            return;
+        };
+        if self.state.consul_pending.contains_key(&mission_id) {
+            self.state.notify(
+                UiMessageKind::Info,
+                format!("The Consul for {mission_id} is already conferring."),
+            );
+            return;
+        }
+        let Some(draft) = self.state.consul_drafts.get(&mission_id) else {
+            return;
+        };
+        let raw_text = draft.text().to_owned();
+        let message = raw_text.trim().to_owned();
+        if message.is_empty() {
+            self.state.set_error("Message cannot be empty");
+            return;
+        }
+        if let Some(lead) = self
+            .state
+            .mission
+            .as_ref()
+            .filter(|mission| mission.id == mission_id)
+            .and_then(|mission| mission.lead.as_ref())
+            .filter(|lead| !lead.run_status.is_execution_finished())
+        {
+            let reason = if lead.run_status == RunStatus::NeedsUser {
+                format!(
+                    "The Consul is waiting on you in {} — use `u` to open its attention first.",
+                    lead.run_id
+                )
+            } else if matches!(lead.run_status, RunStatus::Paused | RunStatus::Interrupted) {
+                format!(
+                    "The Consul is {:?} in {} — open that run and resume it before sending another message.",
+                    lead.run_status, lead.run_id
+                )
+            } else {
+                format!(
+                    "The Consul is {:?} in {} — wait for that turn to finish.",
+                    lead.run_status, lead.run_id
+                )
+            };
+            self.state.set_error(reason);
+            return;
+        }
+
+        let command = WorkerCommand::AskLead {
+            mission_id,
+            message,
+            selection: self.state.new_run.execution.selection(),
+            effort: self.state.new_run.effort.into(),
+        };
+        if let Some(ticket) = self.dispatch_ticketed(command) {
+            self.state.consul_pending.insert(
+                mission_id,
+                ConsulAskInFlight {
+                    ticket,
+                    sent_text: raw_text,
+                },
+            );
+        }
+    }
+
+    /// Reads a proposal preview now, then leaves it pinned in state for the
+    /// confirmation card and the eventual freshness check in the service.
+    fn open_lead_plan_preview(&mut self) {
+        if self.state.lead_plan_pending_ticket.is_some() {
+            self.state.notify(
+                UiMessageKind::Info,
+                "Plan approval is in progress; wait for its result.".to_owned(),
+            );
+            return;
+        }
+        let Some(mission_id) = self.state.selected_mission else {
+            return;
+        };
+        if self.state.consul_pending.contains_key(&mission_id) {
+            self.state.notify(
+                UiMessageKind::Info,
+                "Wait for the current Consul turn before previewing Plan changes.".to_owned(),
+            );
+            return;
+        }
+        self.state.lead_plan_preview = None;
+        self.state.lead_plan_scroll = 0;
+        match self.missions.preview_lead_proposals(mission_id) {
+            Ok(preview) if preview.mission_id == mission_id => {
+                self.state.lead_plan_preview = Some(preview);
+                self.state.lead_plan_scroll = 0;
+                self.state.lead_plan_pending_ticket = None;
+                self.state.overlay = Some(Overlay::PlanConfirm);
+            }
+            Ok(_) => self.state.set_error(
+                "The Consul preview belongs to another Mission; reload before approving."
+                    .to_owned(),
+            ),
+            Err(error) => self
+                .state
+                .set_error(format!("Could not preview Plan changes: {error}")),
+        }
+    }
+
+    fn handle_plan_confirm_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Up => {
+                self.state.lead_plan_scroll = self.state.lead_plan_scroll.saturating_sub(1);
+            }
+            Intent::Down => {
+                self.state.lead_plan_scroll = self.state.lead_plan_scroll.saturating_add(1);
+            }
+            Intent::PageUp => {
+                self.state.lead_plan_scroll = self.state.lead_plan_scroll.saturating_sub(10);
+            }
+            Intent::PageDown => {
+                self.state.lead_plan_scroll = self.state.lead_plan_scroll.saturating_add(10);
+            }
+            Intent::Home => self.state.lead_plan_scroll = 0,
+            Intent::Enter => self.approve_lead_plan_preview(),
+            _ => {}
+        }
+    }
+
+    fn approve_lead_plan_preview(&mut self) {
+        if self.state.lead_plan_pending_ticket.is_some() {
+            return;
+        }
+        let Some(preview) = self.state.lead_plan_preview.clone() else {
+            self.state
+                .set_error("There is no pinned Plan preview to approve");
+            self.state.overlay = None;
+            return;
+        };
+        if let Some(ticket) = self.dispatch_ticketed(WorkerCommand::ApplyLeadPlan {
+            preview: Box::new(preview),
+        }) {
+            self.state.lead_plan_pending_ticket = Some(ticket);
+        }
+    }
+
     /// Resolves the selected attention with `response` (`None` approves a
     /// permission as asked) and closes the overlay.
     fn submit_attention(&mut self, response: Option<String>) {
@@ -646,6 +870,15 @@ impl TuiApp {
         match self.state.overlay {
             Some(Overlay::Attention) => self.state.attention_response.paste(text),
             Some(Overlay::Continue) => self.state.continue_instruction.paste(text),
+            Some(Overlay::ConsulChat) => {
+                if let Some(mission_id) = self.state.consul_chat_mission {
+                    self.state
+                        .consul_drafts
+                        .entry(mission_id)
+                        .or_default()
+                        .paste(text);
+                }
+            }
             None if self.state.screen == Screen::NewRun => {
                 self.edit_text(|field| field.paste(text));
             }
@@ -770,6 +1003,8 @@ impl TuiApp {
             Intent::StartPackage if detail => self.start_selected_package(),
             Intent::Integrate if detail => self.open_integrate_confirmation(),
             Intent::Attention if detail => self.open_package_attention(),
+            Intent::Consul if detail => self.open_consul_chat(),
+            Intent::PreviewPlan if detail => self.open_lead_plan_preview(),
             Intent::AutoApprove if detail => self.toggle_mission_auto_approve(),
             Intent::EnterSenate => self.enter_senate(),
             Intent::DismissMessage => self.state.dismiss_message(),
@@ -806,24 +1041,73 @@ impl TuiApp {
     /// the mission. The overlay reads the selected run's details, so the
     /// package's run becomes the selected run first.
     fn open_package_attention(&mut self) {
-        let Some(package) = self.state.selected_package_summary() else {
-            return;
-        };
-        let Some(run_id) = package.current_run else {
+        if let Some(package) = self.state.selected_package_summary()
+            && package.status == WorkPackageStatus::Blocked
+            && let Some(run_id) = package.current_run
+        {
+            let title = package.title.clone();
+            self.state.selected_run = Some(run_id);
+            self.refresh_selected();
+            if self
+                .state
+                .details
+                .as_ref()
+                .is_some_and(|details| !details.attention.is_empty())
+            {
+                self.open_attention();
+                return;
+            }
+            // A blocked package can also mean its dependency is waiting; in
+            // that case the selected run has no question to answer. Give the
+            // lead's own attention a chance before reporting no work.
+            if self.lead_needs_user() {
+                self.open_lead_attention();
+                return;
+            }
             self.state.notify(
                 UiMessageKind::Info,
-                format!("{} has no run yet, so nothing is asking.", package.title),
-            );
-            return;
-        };
-        if package.status != WorkPackageStatus::Blocked {
-            self.state.notify(
-                UiMessageKind::Info,
-                format!("{} is not waiting on you right now.", package.title),
+                format!("{title} has no pending attention request."),
             );
             return;
         }
-        self.state.selected_run = Some(run_id);
+        if self.lead_needs_user() {
+            self.open_lead_attention();
+            return;
+        }
+        if let Some(package) = self.state.selected_package_summary() {
+            if package.current_run.is_some() {
+                self.state.notify(
+                    UiMessageKind::Info,
+                    format!("{} is not waiting on you right now.", package.title),
+                );
+            } else {
+                self.state.notify(
+                    UiMessageKind::Info,
+                    format!("{} has no run yet, so nothing is asking.", package.title),
+                );
+            }
+        }
+    }
+
+    fn lead_needs_user(&self) -> bool {
+        self.state
+            .mission
+            .as_ref()
+            .and_then(|mission| mission.lead.as_ref())
+            .is_some_and(|lead| lead.run_status == RunStatus::NeedsUser)
+    }
+
+    fn open_lead_attention(&mut self) {
+        let Some(lead_run_id) = self
+            .state
+            .mission
+            .as_ref()
+            .and_then(|mission| mission.lead.as_ref())
+            .map(|lead| lead.run_id)
+        else {
+            return;
+        };
+        self.state.selected_run = Some(lead_run_id);
         self.refresh_selected();
         self.open_attention();
     }
@@ -1725,6 +2009,10 @@ impl TuiApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ticket-scoped outcome dispatch table"
+    )]
     fn handle_worker_result(&mut self, result: WorkerResult) {
         self.state.settle_action(result.action, result.run_id);
         let draft_restored = result.action == ActionKind::Start
@@ -1751,6 +2039,16 @@ impl TuiApp {
             Ok(success) => {
                 if let WorkerSuccess::Purged(receipt) = success {
                     self.settle_purge(receipt.run_id);
+                    return;
+                }
+                if let WorkerSuccess::LeadAsked(turn, details) = success {
+                    self.settle_consul_ask(result.ticket, turn.answer, *details);
+                    self.refresh();
+                    return;
+                }
+                if let WorkerSuccess::PlanApplied(details) = success {
+                    self.settle_lead_plan(result.ticket, *details);
+                    self.refresh();
                     return;
                 }
                 if let WorkerSuccess::Integrated(_) | WorkerSuccess::PackageStarted(..) = &success {
@@ -1814,6 +2112,8 @@ impl TuiApp {
                     ),
                     WorkerSuccess::Execution(_)
                     | WorkerSuccess::ApplyNeedsRebase { .. }
+                    | WorkerSuccess::LeadAsked(..)
+                    | WorkerSuccess::PlanApplied(..)
                     | WorkerSuccess::Purged(_)
                     | WorkerSuccess::PackageStarted(..)
                     | WorkerSuccess::Integrated(_) => {
@@ -1823,6 +2123,32 @@ impl TuiApp {
                 self.state.set_message(message);
             }
             Err(error) => {
+                if result.action == ActionKind::AskLead {
+                    let Some(mission_id) = self.consul_mission_for_ticket(result.ticket) else {
+                        return;
+                    };
+                    self.state.consul_pending.remove(&mission_id);
+                    self.state.set_error(format!(
+                        "Consul turn failed for {mission_id}: {error}. Your draft is preserved."
+                    ));
+                    self.refresh();
+                    return;
+                }
+                if result.action == ActionKind::ApplyLeadPlan
+                    && self.state.lead_plan_pending_ticket == Some(result.ticket)
+                {
+                    self.state.lead_plan_pending_ticket = None;
+                    self.state.lead_plan_preview = None;
+                    self.state.lead_plan_scroll = 0;
+                    if self.state.overlay == Some(Overlay::PlanConfirm) {
+                        self.state.overlay = None;
+                    }
+                    self.state.set_error(format!(
+                        "Plan approval failed. Reload the Mission and preview again before approving: {error}"
+                    ));
+                    self.refresh();
+                    return;
+                }
                 if let (ActionKind::Publish, Some(run_id)) = (result.action, result.run_id) {
                     self.present_publish(PublishOutcome::Failed { run_id, error });
                     self.refresh();
@@ -1836,6 +2162,80 @@ impl TuiApp {
             }
         }
         self.refresh();
+    }
+
+    fn consul_mission_for_ticket(&self, ticket: u64) -> Option<MissionId> {
+        self.state
+            .consul_pending
+            .iter()
+            .find_map(|(mission_id, pending)| (pending.ticket == ticket).then_some(*mission_id))
+    }
+
+    fn settle_consul_ask(
+        &mut self,
+        ticket: u64,
+        answer: Option<LeadAnswer>,
+        details: crate::app::MissionDetails,
+    ) {
+        let Some(mission_id) = self.consul_mission_for_ticket(ticket) else {
+            return;
+        };
+        let Some(pending) = self.state.consul_pending.remove(&mission_id) else {
+            return;
+        };
+        if details.id != mission_id {
+            self.state.set_error(format!(
+                "Consul response for {mission_id} named another Mission; the draft is preserved."
+            ));
+            return;
+        }
+        if self
+            .state
+            .consul_drafts
+            .get(&mission_id)
+            .is_some_and(|draft| draft.text() == pending.sent_text)
+        {
+            self.state
+                .consul_drafts
+                .insert(mission_id, super::state::TextField::default());
+        }
+        if self.state.selected_mission == Some(mission_id) {
+            self.state.replace_mission(details);
+            if let Some(answer) = answer {
+                self.state.lead_answer = Some(answer);
+            } else {
+                self.refresh_lead_answer(mission_id);
+            }
+        }
+        self.state
+            .set_message(format!("Consul turn finished for {mission_id}."));
+    }
+
+    fn settle_lead_plan(&mut self, ticket: u64, details: crate::app::MissionDetails) {
+        if self.state.lead_plan_pending_ticket != Some(ticket) {
+            return;
+        }
+        let preview_mission = self
+            .state
+            .lead_plan_preview
+            .as_ref()
+            .map(|preview| preview.mission_id);
+        self.state.lead_plan_pending_ticket = None;
+        self.state.lead_plan_preview = None;
+        self.state.lead_plan_scroll = 0;
+        if self.state.overlay == Some(Overlay::PlanConfirm) {
+            self.state.overlay = None;
+        }
+        if preview_mission != Some(details.id) {
+            self.state.set_error(
+                "Plan approval returned a different Mission; reload before continuing.".to_owned(),
+            );
+            return;
+        }
+        if self.state.selected_mission == Some(details.id) {
+            self.state.replace_mission(details);
+        }
+        self.state.set_message("Plan changes approved and applied.");
     }
 
     /// A mission action finishing is news about the package, not the run:
@@ -2322,10 +2722,12 @@ fn spawn_update_check() -> Receiver<UpdateOutcome> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{RunDetails, RunListItem, StageSummary};
+    use crate::app::{LeadPlanPreview, LeadSummary, RunDetails, RunListItem, StageSummary};
     use crate::domain::{EffortSetting, Role, RunId, RunStatus, StageId, StageKind, WorkflowKind};
     use crate::tui::state::{CONCURRENT_AGENTS, ExecutionChoice};
 
@@ -2356,6 +2758,388 @@ mod tests {
             app.state.in_flight
         );
         assert!(app.state.attention_response.text().is_empty());
+    }
+
+    #[test]
+    fn consul_chat_types_command_letters_unicode_and_paste_without_dispatching() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.screen = Screen::MissionDetail;
+        app.state.selected_mission = Some(mission_id);
+        app.state.mission = Some(mission_details(mission_id, None));
+
+        app.handle_intent(Intent::Consul);
+        for (character, modifiers) in [
+            ('q', KeyModifiers::NONE),
+            ('C', KeyModifiers::SHIFT),
+            ('é', KeyModifiers::NONE),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                modifiers,
+            )));
+        }
+        app.handle_event(Event::Paste("\nreview the tests".to_owned()));
+
+        assert_eq!(app.state.overlay, Some(Overlay::ConsulChat));
+        assert_eq!(
+            app.state.consul_drafts[&mission_id].text(),
+            "qCé review the tests"
+        );
+        assert!(!app.state.quit, "plain q in the focused composer is text");
+        assert!(
+            app.state.in_flight.is_empty(),
+            "typing and paste do not send"
+        );
+
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.consul_chat_mission, None);
+        assert_eq!(
+            app.state.consul_drafts[&mission_id].text(),
+            "qCé review the tests"
+        );
+    }
+
+    #[test]
+    fn consul_drafts_stay_with_their_mission_when_chat_is_reopened() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let first = MissionId::from_u128(41);
+        let second = MissionId::from_u128(42);
+        app.state.screen = Screen::MissionDetail;
+        app.state.selected_mission = Some(first);
+        app.state.mission = Some(mission_details(first, None));
+        app.handle_intent(Intent::Consul);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        app.handle_intent(Intent::Escape);
+
+        app.state.selected_mission = Some(second);
+        app.state.mission = Some(mission_details(second, None));
+        app.handle_intent(Intent::Consul);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(app.state.consul_drafts[&second].text(), "C");
+        app.handle_intent(Intent::Escape);
+
+        app.state.selected_mission = Some(first);
+        app.state.mission = Some(mission_details(first, None));
+        app.handle_intent(Intent::Consul);
+        assert_eq!(app.state.consul_drafts[&first].text(), "q");
+        assert_eq!(app.state.consul_drafts[&second].text(), "C");
+    }
+
+    #[test]
+    fn consul_enter_dispatches_a_ticketed_worker_and_keeps_the_draft_pending() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.screen = Screen::MissionDetail;
+        app.state.selected_mission = Some(mission_id);
+        app.state.mission = Some(mission_details(mission_id, None));
+        app.state.consul_chat_mission = Some(mission_id);
+        app.state.overlay = Some(Overlay::ConsulChat);
+        app.state.consul_drafts.insert(
+            mission_id,
+            super::super::state::TextField::new("please inspect the plan"),
+        );
+
+        app.handle_intent(Intent::Enter);
+
+        assert!(app.state.consul_pending.contains_key(&mission_id));
+        assert_eq!(
+            app.state.consul_drafts[&mission_id].text(),
+            "please inspect the plan"
+        );
+        assert!(
+            app.state
+                .in_flight
+                .iter()
+                .any(|action| action.action == ActionKind::AskLead)
+        );
+        assert_eq!(app.state.overlay, Some(Overlay::ConsulChat));
+    }
+
+    #[test]
+    fn successful_consul_result_clears_only_the_unchanged_submitted_draft() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.selected_mission = Some(mission_id);
+        app.state.mission = Some(mission_details(mission_id, None));
+        app.state.consul_drafts.insert(
+            mission_id,
+            super::super::state::TextField::new("sent words"),
+        );
+        app.state.consul_pending.insert(
+            mission_id,
+            ConsulAskInFlight {
+                ticket: 29,
+                sent_text: "sent words".to_owned(),
+            },
+        );
+
+        app.settle_consul_ask(29, None, mission_details(mission_id, None));
+
+        assert!(!app.state.consul_pending.contains_key(&mission_id));
+        assert!(app.state.consul_drafts[&mission_id].text().is_empty());
+        assert_eq!(app.state.mission.as_ref().unwrap().id, mission_id);
+    }
+
+    #[test]
+    fn late_consul_result_does_not_replace_the_selected_mission() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let requested = MissionId::from_u128(41);
+        let selected = MissionId::from_u128(42);
+        app.state.selected_mission = Some(selected);
+        app.state.mission = Some(mission_details(selected, None));
+        app.state.consul_drafts.insert(
+            requested,
+            super::super::state::TextField::new("newer draft"),
+        );
+        app.state.consul_pending.insert(
+            requested,
+            ConsulAskInFlight {
+                ticket: 29,
+                sent_text: "older submitted words".to_owned(),
+            },
+        );
+
+        app.settle_consul_ask(29, None, mission_details(requested, None));
+
+        assert_eq!(app.state.selected_mission, Some(selected));
+        assert_eq!(app.state.mission.as_ref().unwrap().id, selected);
+        assert_eq!(app.state.consul_drafts[&requested].text(), "newer draft");
+    }
+
+    #[test]
+    fn consul_pending_duplicate_and_provider_capacity_refusals_keep_the_draft() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.consul_chat_mission = Some(mission_id);
+        app.state.overlay = Some(Overlay::ConsulChat);
+        app.state.consul_drafts.insert(
+            mission_id,
+            super::super::state::TextField::new("keep this draft"),
+        );
+        app.state.consul_pending.insert(
+            mission_id,
+            ConsulAskInFlight {
+                ticket: 7,
+                sent_text: "older ask".to_owned(),
+            },
+        );
+        app.handle_intent(Intent::Enter);
+        assert_eq!(
+            app.state.consul_drafts[&mission_id].text(),
+            "keep this draft"
+        );
+        assert!(
+            app.state.in_flight.is_empty(),
+            "a duplicate ask is not dispatched"
+        );
+
+        app.state.consul_pending.remove(&mission_id);
+        for _ in 0..CONCURRENT_AGENTS {
+            app.state.begin_action(ActionKind::AskLead, None);
+        }
+        app.handle_intent(Intent::Enter);
+        assert_eq!(
+            app.state.consul_drafts[&mission_id].text(),
+            "keep this draft"
+        );
+        assert_eq!(app.state.in_flight.len(), CONCURRENT_AGENTS);
+        assert!(
+            app.state
+                .message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("already working")
+        );
+        assert!(!app.state.consul_pending.contains_key(&mission_id));
+    }
+
+    #[test]
+    fn a_consul_waiting_on_the_operator_routes_attention_instead_of_sending() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        let lead_id = RunId::from_u128(77);
+        app.state.screen = Screen::MissionDetail;
+        app.state.selected_mission = Some(mission_id);
+        app.state.mission = Some(mission_details(
+            mission_id,
+            Some(LeadSummary {
+                run_id: lead_id,
+                run_status: RunStatus::NeedsUser,
+                turns: 1,
+            }),
+        ));
+        app.state.consul_chat_mission = Some(mission_id);
+        app.state.overlay = Some(Overlay::ConsulChat);
+        app.state
+            .consul_drafts
+            .insert(mission_id, super::super::state::TextField::new("continue"));
+
+        app.handle_intent(Intent::Enter);
+
+        assert!(!app.state.consul_pending.contains_key(&mission_id));
+        assert!(app.state.in_flight.is_empty());
+        let message = &app.state.message.as_ref().unwrap().text;
+        assert!(message.contains(&lead_id.to_string()));
+        assert!(message.contains("`u`"));
+        assert_eq!(app.state.consul_drafts[&mission_id].text(), "continue");
+    }
+
+    #[test]
+    fn failed_consul_worker_result_preserves_draft_and_releases_mission_lock() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.screen = Screen::Runs;
+        app.state.consul_drafts.insert(
+            mission_id,
+            super::super::state::TextField::new("please keep this"),
+        );
+        app.state.consul_pending.insert(
+            mission_id,
+            ConsulAskInFlight {
+                ticket: 29,
+                sent_text: "please keep this".to_owned(),
+            },
+        );
+        app.state.begin_action(ActionKind::AskLead, None);
+
+        app.handle_worker_result(WorkerResult {
+            ticket: 29,
+            action: ActionKind::AskLead,
+            run_id: None,
+            result: Err("provider unavailable".to_owned()),
+        });
+
+        assert!(!app.state.consul_pending.contains_key(&mission_id));
+        assert_eq!(
+            app.state.consul_drafts[&mission_id].text(),
+            "please keep this"
+        );
+        assert!(
+            app.state
+                .message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("draft is preserved")
+        );
+        assert!(app.state.in_flight.is_empty());
+    }
+
+    #[test]
+    fn plan_changes_require_enter_and_stale_refusal_discards_the_preview() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.screen = Screen::Runs;
+        app.state.lead_plan_preview = Some(lead_plan_preview(mission_id));
+        app.state.overlay = Some(Overlay::PlanConfirm);
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.lead_plan_preview.is_none());
+        assert!(app.state.in_flight.is_empty(), "Esc never approves");
+
+        app.state.lead_plan_preview = Some(lead_plan_preview(mission_id));
+        app.state.overlay = Some(Overlay::PlanConfirm);
+        app.state.lead_plan_pending_ticket = Some(35);
+        app.state.begin_action(ActionKind::ApplyLeadPlan, None);
+        app.handle_worker_result(WorkerResult {
+            ticket: 35,
+            action: ActionKind::ApplyLeadPlan,
+            run_id: None,
+            result: Err("stale approval".to_owned()),
+        });
+        assert_eq!(app.state.overlay, None);
+        assert!(app.state.lead_plan_preview.is_none());
+        assert_eq!(app.state.lead_plan_pending_ticket, None);
+        let message = &app.state.message.as_ref().unwrap().text;
+        assert!(message.contains("Plan approval failed"));
+        assert!(message.contains("preview again"));
+        assert!(app.state.in_flight.is_empty());
+    }
+
+    #[test]
+    fn enter_is_the_only_plan_confirmation_that_dispatches_approval() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.lead_plan_preview = Some(lead_plan_preview(mission_id));
+        app.state.overlay = Some(Overlay::PlanConfirm);
+
+        app.handle_intent(Intent::Enter);
+
+        assert!(app.state.lead_plan_pending_ticket.is_some());
+        assert!(app.state.lead_plan_preview.is_some());
+        assert_eq!(app.state.overlay, Some(Overlay::PlanConfirm));
+        assert!(
+            app.state
+                .in_flight
+                .iter()
+                .any(|action| action.action == ActionKind::ApplyLeadPlan)
+        );
+    }
+
+    #[test]
+    fn hiding_pending_approval_keeps_its_ticket_and_cannot_replace_its_mission() {
+        let (mut app, _fixture) = app_with(details(RunStatus::Completed, WorkflowKind::Standard));
+        let mission_id = MissionId::from_u128(41);
+        app.state.lead_plan_preview = Some(lead_plan_preview(mission_id));
+        app.state.lead_plan_pending_ticket = Some(35);
+        app.state.overlay = Some(Overlay::PlanConfirm);
+        app.handle_intent(Intent::Escape);
+        assert_eq!(app.state.overlay, None);
+        assert_eq!(app.state.lead_plan_pending_ticket, Some(35));
+        app.state.selected_mission = Some(MissionId::from_u128(42));
+        app.open_lead_plan_preview();
+        assert_eq!(
+            app.state.lead_plan_preview.as_ref().unwrap().mission_id,
+            mission_id
+        );
+        assert_eq!(app.state.lead_plan_pending_ticket, Some(35));
+        app.settle_lead_plan(35, mission_details(mission_id, None));
+        assert_eq!(app.state.lead_plan_pending_ticket, None);
+        assert!(app.state.lead_plan_preview.is_none());
+        assert_eq!(app.state.selected_mission, Some(MissionId::from_u128(42)));
+    }
+
+    fn mission_details(id: MissionId, lead: Option<LeadSummary>) -> crate::app::MissionDetails {
+        let at = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).unwrap();
+        crate::app::MissionDetails {
+            id,
+            title: "Fixture mission".to_owned(),
+            goal: "Exercise Consul UI".to_owned(),
+            repository: PathBuf::from("/repo"),
+            base_commit: "abc".to_owned(),
+            status: crate::domain::MissionStatus::Active,
+            packages: vec![],
+            decisions: vec![],
+            attention: crate::domain::MissionAttention::default(),
+            lead,
+            revision: crate::store::MissionRevision::initial(),
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    fn lead_plan_preview(mission_id: MissionId) -> LeadPlanPreview {
+        LeadPlanPreview {
+            mission_id,
+            approval: crate::store::LeadProposalApproval {
+                mission_revision: crate::store::MissionRevision::initial(),
+                run_id: RunId::from_u128(77),
+                run_revision: crate::store::RunRevision::initial(),
+                stage_id: StageId::new("engineering-lead").unwrap(),
+                answer_sha256: "ab".repeat(32),
+            },
+            changes: vec![],
+            text: "No changes".to_owned(),
+        }
     }
 
     fn app_with(details: RunDetails) -> (TuiApp, TempDir) {

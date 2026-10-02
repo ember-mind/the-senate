@@ -228,6 +228,24 @@ pub enum MissionCommand {
         #[arg(long)]
         effort: Option<String>,
     },
+    /// Coordinate ready packages and existing child runs until human action
+    /// is required. Rerun without options to reuse the saved drive policy.
+    Drive {
+        mission_id: MissionId,
+        #[arg(long)]
+        max_parallel: Option<usize>,
+        #[arg(long, conflicts_with = "profile")]
+        provider: Option<String>,
+        #[arg(long, conflicts_with = "provider")]
+        profile: Option<String>,
+        #[arg(long, requires = "provider")]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        /// Perform one scheduling pass, then return while providers keep working.
+        #[arg(long)]
+        once: bool,
+    },
     /// Bind an existing run to a ready package.
     Attach {
         mission_id: MissionId,

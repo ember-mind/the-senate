@@ -62,3 +62,5 @@ senate world --demo review
 - `src/world/server.rs` — host-header, token-comparison, origin-check, and browser-URL unit tests; an integration-style test drives `GET /api/health` over a real loopback socket with and without a valid token/host, and fetches the whole vendored three.js.
 - `src/world/projection.rs` — working/in-review/testing/blocked/delivered/quiet projections, Cohort numbering by creation, conferring lead, schema field names.
 - `src/world/assets.rs` — index lookup, unknown-path 404, and traversal-path (`/../Cargo.toml`) non-match.
+
+- Instance-lock release explicitly unlocks before closing the descriptor, so concurrent subprocess creation cannot retain a completed instance's lock. The lock file stays in place.

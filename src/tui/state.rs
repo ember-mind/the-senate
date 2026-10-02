@@ -67,6 +67,10 @@ impl CycleChoice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Overlay {
     Help,
+    /// Free-text prompt for the selected mission's Consul.
+    ConsulChat,
+    /// The exact Plan changes snapshot awaiting explicit approval.
+    PlanConfirm,
     Attention,
     ApplyConfirm,
     /// The last stop before a delivered package is recorded as integrated.
@@ -127,6 +131,15 @@ pub(crate) struct StartFailure {
     pub error: String,
     /// Whether the task went back into the new-run form.
     pub draft_restored: bool,
+}
+
+/// A Consul turn this session sent, keyed by the Mission it belongs to.
+/// Retaining the original draft lets an answer clear only the text that was
+/// actually submitted, even if the operator edited the composer meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConsulAskInFlight {
+    pub ticket: u64,
+    pub sent_text: String,
 }
 
 /// A publish the operator is waiting on.
@@ -683,6 +696,22 @@ pub(crate) struct TuiState {
     /// The mission's lead's latest finished answer, current as of the last
     /// refresh. `None` when the lead has not answered yet, or has none.
     pub lead_answer: Option<LeadAnswer>,
+    /// Drafts are session-local and stay with their Mission when the operator
+    /// moves between campaigns or closes the chat overlay.
+    pub consul_drafts: HashMap<MissionId, TextField>,
+    /// The Mission captured when the chat overlay opened. It must not follow
+    /// selection changes or a late result from another Mission.
+    pub consul_chat_mission: Option<MissionId>,
+    /// One active Consul request per Mission, independent of the selected
+    /// campaign. The worker ticket distinguishes out-of-order outcomes.
+    pub consul_pending: HashMap<MissionId, ConsulAskInFlight>,
+    /// The preview is pinned until explicitly dismissed or applied. Approval
+    /// validates its answer and Mission revisions again inside the service.
+    pub lead_plan_preview: Option<crate::app::LeadPlanPreview>,
+    /// Scroll position inside the pinned Plan changes preview.
+    pub lead_plan_scroll: usize,
+    /// Ticket for the single approval dispatched from the preview.
+    pub lead_plan_pending_ticket: Option<u64>,
     pub selected_package: Option<WorkPackageId>,
     pub selected_package_index: usize,
     /// Whether the open run detail was reached from a mission, so leaving it
@@ -824,6 +853,12 @@ impl TuiState {
             selected_mission_index: 0,
             mission: None,
             lead_answer: None,
+            consul_drafts: HashMap::new(),
+            consul_chat_mission: None,
+            consul_pending: HashMap::new(),
+            lead_plan_preview: None,
+            lead_plan_scroll: 0,
+            lead_plan_pending_ticket: None,
             selected_package: None,
             selected_package_index: 0,
             run_opened_from_mission: false,
@@ -1151,10 +1186,10 @@ impl TuiState {
             return None;
         }
         if let Some(target) = command.run_id()
-            && let Some(holder) = self
-                .in_flight
-                .iter()
-                .find(|entry| entry.run_id == Some(target))
+            && let Some(holder) = self.in_flight.iter().find(|entry| {
+                entry.run_id == Some(target)
+                    || (entry.action == ActionKind::AskLead && entry.run_id.is_none())
+            })
         {
             return Some(Refusal::RunIsHeld(holder.action));
         }
@@ -1166,14 +1201,16 @@ impl TuiState {
 
     /// Whether some in-flight action currently holds this run.
     ///
-    /// A start in flight has no run id until it reports back, so while one is
-    /// running any run may be the one it is bringing up; those are treated as
-    /// held rather than offered a second driver.
+    /// A start or lead request has no run id until it reports back, so while
+    /// one is running any run may be the one it is bringing up; those are
+    /// treated as held rather than offered a second driver.
     pub(crate) fn run_is_held(&self, run_id: RunId) -> bool {
         self.in_flight.iter().any(|entry| {
             entry.run_id == Some(run_id)
-                || (matches!(entry.action, ActionKind::Start | ActionKind::StartPackage)
-                    && entry.run_id.is_none())
+                || (matches!(
+                    entry.action,
+                    ActionKind::Start | ActionKind::StartPackage | ActionKind::AskLead
+                ) && entry.run_id.is_none())
         })
     }
 
@@ -1420,6 +1457,32 @@ mod tests {
     }
 
     #[test]
+    fn consul_drafts_are_isolated_by_mission_and_keep_unicode_edits() {
+        let mut state = TuiState::new(Path::new("/repo"));
+        let first = MissionId::from_u128(1);
+        let second = MissionId::from_u128(2);
+        state
+            .consul_drafts
+            .entry(first)
+            .or_default()
+            .paste("Review café\nthen summarize");
+        state.consul_drafts.entry(second).or_default().insert('q');
+
+        assert_eq!(
+            state.consul_drafts[&first].text(),
+            "Review café then summarize"
+        );
+        assert_eq!(state.consul_drafts[&second].text(), "q");
+        state.consul_drafts.get_mut(&first).unwrap().left();
+        state.consul_drafts.get_mut(&first).unwrap().delete();
+        assert_eq!(
+            state.consul_drafts[&first].text(),
+            "Review café then summariz"
+        );
+        assert_eq!(state.consul_drafts[&second].text(), "q");
+    }
+
+    #[test]
     fn line_kills_cut_only_their_side_of_the_cursor() {
         let mut field = TextField::new("caffè latte");
         field.left();
@@ -1516,6 +1579,8 @@ mod tests {
         for overlay in [
             Overlay::Help,
             Overlay::Attention,
+            Overlay::ConsulChat,
+            Overlay::PlanConfirm,
             Overlay::ApplyConfirm,
             Overlay::DiscardConfirm,
             Overlay::Update,
@@ -1541,6 +1606,19 @@ mod tests {
         state.screen = Screen::RunDetail;
         state.motion_phase = 1;
         assert_eq!(state.motion_frame().active_phase(), 1);
+    }
+
+    #[test]
+    fn an_unbound_consul_turn_holds_runs_until_its_lead_run_is_known() {
+        let mut state = TuiState::new(Path::new("/repo"));
+        let run_id = RunId::from_u128(7);
+        state.begin_action(ActionKind::AskLead, None);
+
+        assert!(state.run_is_held(run_id));
+        assert!(matches!(
+            state.action_refusal(&WorkerCommand::ResumeRun { run_id }),
+            Some(Refusal::RunIsHeld(ActionKind::AskLead))
+        ));
     }
 
     /// The panel refreshes twice a second and an artifact is up to a megabyte

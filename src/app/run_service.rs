@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    AttentionKind, AttentionRequestId, ConfigSnapshotId, EventId, EventMetadata, Run, RunId,
-    RunStatus, RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
+    AttentionKind, AttentionRequestId, ConfigSnapshotId, DomainEvent, EventId, EventMetadata, Run,
+    RunId, RunStatus, RunTransition, StageId, StageStatus, WorkflowDefinition, WorkflowKind,
 };
 use crate::engine::{EngineStatus, WorkflowEngine};
 use crate::git::GitRepository;
@@ -128,6 +128,17 @@ pub struct RunService<F> {
     gh: GhClient,
 }
 
+/// An application can join Run creation to its own durable binding before
+/// workspace preparation or provider work begins.
+type RunCreation<'a> = dyn Fn(
+        &mut SqliteStore,
+        &Run,
+        &RunInput,
+        &ResolvedConfigSnapshot,
+        &[DomainEvent],
+    ) -> Result<(), AppError>
+    + 'a;
+
 impl<F> RunService<F>
 where
     F: ProviderResolver,
@@ -226,6 +237,33 @@ where
     where
         F: ProviderFactory,
     {
+        self.start_run_bound_observed(
+            workflow_kind,
+            task.into(),
+            repository_path.as_ref(),
+            selection,
+            effort.into(),
+            image,
+            observe,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_run_bound_observed(
+        &self,
+        workflow_kind: WorkflowKind,
+        task: String,
+        repository_path: &Path,
+        selection: Option<ExecutionSelection>,
+        effort: EffortRequest,
+        image: &ImageGenerationPlan,
+        observe: &dyn Fn(StartProgress),
+        persist: Option<&RunCreation<'_>>,
+    ) -> Result<ExecutionReport, AppError>
+    where
+        F: ProviderFactory,
+    {
         let created_at = now();
         let workflow = WorkflowDefinition::built_in(workflow_kind);
         let run_id = RunId::new();
@@ -233,7 +271,7 @@ where
         let selection = selection.ok_or(AppError::NoProductionProvider)?;
         let config = self.provider_factory.config_for_new_run_with_image(
             selection,
-            effort.into(),
+            effort,
             image,
             &workflow,
             config_id.clone(),
@@ -241,12 +279,13 @@ where
         )?;
         self.start_run_with_config_at(
             workflow,
-            task.into(),
-            repository_path.as_ref(),
+            task,
+            repository_path,
             &config,
             run_id,
             created_at,
             observe,
+            persist,
         )
     }
 
@@ -265,6 +304,7 @@ where
             RunId::new(),
             now(),
             &|_| {},
+            None,
         )
     }
 
@@ -291,6 +331,7 @@ where
         run_id: RunId,
         created_at: DateTime<Utc>,
         observe: &dyn Fn(StartProgress),
+        persist: Option<&RunCreation<'_>>,
     ) -> Result<ExecutionReport, AppError> {
         let git = crate::git::Git::default();
         let mut repository = GitRepository::discover(repository_path)?;
@@ -357,7 +398,11 @@ where
         let run = Run::new(run_id, workflow, config_id, created_at);
         let created = run.created_event(EventMetadata::new(EventId::new(), created_at));
         let mut store = SqliteStore::open(&self.database)?;
-        store.create_run_with_input(&run, &input, config, &[created])?;
+        if let Some(persist) = persist {
+            persist(&mut store, &run, &input, config, &[created])?;
+        } else {
+            store.create_run_with_input(&run, &input, config, &[created])?;
+        }
         observe(StartProgress::PreparingWorkspace(run_id));
 
         let manager = WorkspaceManager::new(&self.worktrees);
@@ -390,6 +435,30 @@ where
     fn resume_run_once(&self, run_id: RunId) -> Result<ExecutionReport, AppError> {
         let mut store = SqliteStore::open(&self.database)?;
         let before = last_sequence(&store, run_id)?;
+        // Mission Run creation and binding are atomic. A crash immediately
+        // afterwards can leave a Created Run without a workspace intent;
+        // the binding identifies its source so preparation can be recovered.
+        if store.load_run(run_id)?.run.status() == RunStatus::Created
+            && store.load_workspace(run_id)?.is_none()
+        {
+            let mission_id = store
+                .mission_of_run(run_id)?
+                .map(|binding| binding.mission_id)
+                .or(store.mission_of_lead_run(run_id)?);
+            if let Some(mission_id) = mission_id {
+                let mission = store.load_mission(mission_id)?;
+                let repository = GitRepository::discover(mission.input.source_repo_path())?;
+                if !crate::git::source_is_clean(&crate::git::Git::default(), &repository)? {
+                    return Err(AppError::DirtySourceRepository);
+                }
+                WorkspaceManager::new(&self.worktrees).prepare_run_workspace_with(
+                    &mut store,
+                    run_id,
+                    repository.source_path(),
+                    Some(&self.gh),
+                )?;
+            }
+        }
         self.reconcile(&mut store, run_id)?;
         let status = self.drive(&mut store, run_id, ResumeAction::Resume)?;
         self.settle(&mut store, run_id, before, status.as_ref())

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::{
-    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, MissionDetails,
-    MissionService, ProviderFactory, PurgeReceipt, RetryRoute, RunService, StartProgress,
+    ApplyOutcome, EffortRequest, ExecutionReport, ExecutionSelection, LeadPlanPreview, LeadTurn,
+    MissionDetails, MissionService, ProviderFactory, PurgeReceipt, RetryRoute, RunService,
+    StartProgress,
 };
 use crate::domain::{AttentionRequestId, MissionId, RunId, StageId, WorkPackageId, WorkflowKind};
 use crate::workspace::{PublishReceipt, RebaseReceipt};
@@ -27,6 +28,8 @@ pub(crate) enum ActionKind {
     StartPackage,
     /// A delivered package being recorded as integrated.
     Integrate,
+    AskLead,
+    ApplyLeadPlan,
 }
 
 impl ActionKind {
@@ -35,6 +38,8 @@ impl ActionKind {
             Self::Start => "starting run",
             Self::StartPackage => "starting package",
             Self::Integrate => "integrating package",
+            Self::AskLead => "asking the Consul",
+            Self::ApplyLeadPlan => "applying the plan",
             Self::Resume => "resuming run",
             Self::Stop => "stopping run",
             Self::Retry => "retrying stage",
@@ -63,20 +68,31 @@ impl ActionKind {
             | Self::Retry
             | Self::Fix
             | Self::Continue
-            | Self::ResolveAttention => true,
+            | Self::ResolveAttention
+            | Self::AskLead => true,
             Self::Stop
             | Self::Apply
             | Self::Rebase
             | Self::Publish
             | Self::Discard
             | Self::Purge
-            | Self::Integrate => false,
+            | Self::Integrate
+            | Self::ApplyLeadPlan => false,
         }
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum WorkerCommand {
+    AskLead {
+        mission_id: MissionId,
+        message: String,
+        selection: ExecutionSelection,
+        effort: EffortRequest,
+    },
+    ApplyLeadPlan {
+        preview: Box<LeadPlanPreview>,
+    },
     StartRun {
         workflow: WorkflowKind,
         task: String,
@@ -147,6 +163,8 @@ pub(crate) enum WorkerCommand {
 impl WorkerCommand {
     pub(crate) const fn kind(&self) -> ActionKind {
         match self {
+            Self::AskLead { .. } => ActionKind::AskLead,
+            Self::ApplyLeadPlan { .. } => ActionKind::ApplyLeadPlan,
             Self::StartRun { .. } => ActionKind::Start,
             Self::ResumeRun { .. } => ActionKind::Resume,
             Self::StopRun { .. } => ActionKind::Stop,
@@ -166,6 +184,7 @@ impl WorkerCommand {
 
     pub(crate) const fn run_id(&self) -> Option<RunId> {
         match self {
+            Self::AskLead { .. } | Self::ApplyLeadPlan { .. } => None,
             Self::StartRun { .. } | Self::StartPackage { .. } | Self::IntegratePackage { .. } => {
                 None
             }
@@ -186,6 +205,8 @@ impl WorkerCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WorkerSuccess {
+    LeadAsked(LeadTurn, Box<MissionDetails>),
+    PlanApplied(Box<MissionDetails>),
     Execution(ExecutionReport),
     Applied(ApplyOutcome, ExecutionReport),
     Published(PublishReceipt, ExecutionReport),
@@ -209,12 +230,16 @@ impl WorkerSuccess {
     /// The run this action left behind, when it left one.
     pub(crate) const fn report(&self) -> Option<&ExecutionReport> {
         match self {
+            Self::LeadAsked(turn, _) => Some(&turn.report),
             Self::Execution(report)
             | Self::Applied(_, report)
             | Self::Published(_, report)
             | Self::Rebased(_, report)
             | Self::PackageStarted(report, _) => Some(report),
-            Self::Purged(_) | Self::Integrated(_) | Self::ApplyNeedsRebase { .. } => None,
+            Self::Purged(_)
+            | Self::Integrated(_)
+            | Self::PlanApplied(_)
+            | Self::ApplyNeedsRebase { .. } => None,
         }
     }
 }
@@ -389,6 +414,17 @@ where
     F: ProviderFactory,
 {
     match command {
+        WorkerCommand::AskLead {
+            mission_id,
+            message,
+            selection,
+            effort,
+        } => missions
+            .ask_lead(service, mission_id, &message, Some(selection), effort)
+            .map(|(turn, details)| WorkerSuccess::LeadAsked(turn, Box::new(details))),
+        WorkerCommand::ApplyLeadPlan { preview } => missions
+            .approve_lead_proposals(&preview)
+            .map(|details| WorkerSuccess::PlanApplied(Box::new(details))),
         WorkerCommand::StartRun {
             workflow,
             task,

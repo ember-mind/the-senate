@@ -52,6 +52,16 @@ pub struct LeadAnswer {
     pub proposals: Result<Vec<PlanChange>, PlanChangeParseError>,
 }
 
+/// A validated proposal batch pinned to the Mission and answer the operator
+/// inspected. Approval must use this value, never a newly fetched answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadPlanPreview {
+    pub mission_id: crate::domain::MissionId,
+    pub approval: crate::store::LeadProposalApproval,
+    pub changes: Vec<PlanChange>,
+    pub text: String,
+}
+
 impl LeadAnswer {
     /// The answer with its `## Plan changes` section removed: what the
     /// user reads, since the proposals are shown as a list of their own.

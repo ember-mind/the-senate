@@ -666,19 +666,17 @@ fn render_mission_detail(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
-    render_consul_pane(frame, columns[0], mission, state.lead_answer.as_ref());
+    render_consul_pane(frame, columns[0], mission, state);
     render_campaign_pane(frame, columns[1], mission, state);
 }
 
 /// The Consul pane: the mission's lead, its subtitle spoken once, the
-/// latest answer verbatim (never a chat log — the mission brief renders
-/// fresh every turn), and a quiet prompt affordance. Chatting from the TUI
-/// is a later milestone; this pane only shows what the lead last said.
+/// latest answer verbatim, and controls for a new turn or Plan preview.
 fn render_consul_pane(
     frame: &mut Frame<'_>,
     area: Rect,
     mission: &crate::app::MissionDetails,
-    answer: Option<&crate::app::LeadAnswer>,
+    state: &TuiState,
 ) {
     let mut lines = vec![
         theme::section("CONSUL"),
@@ -689,7 +687,7 @@ fn render_consul_pane(
         .lead
         .as_ref()
         .is_some_and(|lead| !lead.run_status.is_execution_finished());
-    match answer {
+    match state.lead_answer.as_ref() {
         Some(answer) => {
             // Markdown headings are structure, not words to read: drop them,
             // and set the paragraph after "Bottom line" in bold as the gist.
@@ -722,16 +720,31 @@ fn render_consul_pane(
         }
         None => {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "No conversation yet. Ask with `senate mission ask {} \"…\"`.",
-                    mission.id
-                ),
+                "No conversation yet. Press C to ask the Consul.",
                 theme::muted(),
             )));
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("> ", theme::muted())));
+    let pending = state.consul_pending.contains_key(&mission.id);
+    lines.push(Line::from(Span::styled(
+        if pending {
+            "Conferring… draft kept until accepted."
+        } else {
+            "C ask Consul · p preview Plan changes"
+        },
+        theme::muted(),
+    )));
+    if let Some(lead) = mission
+        .lead
+        .as_ref()
+        .filter(|lead| lead.run_status == RunStatus::NeedsUser)
+    {
+        lines.push(Line::from(Span::styled(
+            format!("Consul needs you in {} · u answer", lead.run_id),
+            theme::attention(),
+        )));
+    }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -2536,6 +2549,8 @@ fn primary_actions(screen: Screen, state: &TuiState) -> Vec<Span<'static>> {
 /// can take right now.
 fn mission_detail_actions(state: &TuiState, push: &mut impl FnMut(&str, &str, Color)) {
     selected_order_actions(state, push);
+    push("C", "Ask Consul", theme::accent());
+    push("p", "Plan changes", theme::attention());
     push("W", "Enter the Senate", theme::muted_color());
 }
 
@@ -2688,6 +2703,7 @@ a apply · b rebase · P PR · X discard
 f cycle · c/w continue · i technical
 Campaign  ↑↓/j/k Orders · Enter run · S start
 u answer · I bring in · A approve · W Senate
+C ask Consul · p preview Plan changes
 Runs  h archive · H archived · D delete
 Text  Ctrl-U/K/W/Alt-Backspace edit
 Artifact  m raw/rendered";
@@ -2742,6 +2758,8 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
             popup,
         ),
         Overlay::Attention => render_attention(frame, popup, state),
+        Overlay::ConsulChat => render_consul_chat(frame, popup, state),
+        Overlay::PlanConfirm => render_plan_confirmation(frame, popup, state),
         Overlay::Update => render_update(frame, area, state),
         Overlay::ApplyConfirm => render_confirmation(frame, popup, state, Confirmation::Apply),
         Overlay::IntegrateConfirm => render_integrate_confirmation(frame, popup, state),
@@ -2758,6 +2776,126 @@ fn render_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState, overlay: 
         Overlay::Starting => render_starting(frame, area, state),
         Overlay::StartFailed => render_start_failed(frame, area, state),
     }
+}
+
+fn render_consul_chat(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(mission_id) = state.consul_chat_mission else {
+        return;
+    };
+    let pending = state.consul_pending.contains_key(&mission_id);
+    let draft = state
+        .consul_drafts
+        .get(&mission_id)
+        .map_or_else(String::new, |field| field_display(field, true));
+    let block = overlay_block(" Ask Consul ", theme::accent());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Mission {mission_id}")),
+            Line::from(""),
+            Line::from("What should the Consul consider?"),
+        ]),
+        rows[0],
+    );
+    let draft_rows = plan_preview_rows(&draft, rows[1].width);
+    let cursor_row = draft_rows
+        .iter()
+        .position(|row| row.contains('│'))
+        .unwrap_or(0);
+    let scroll = u16::try_from(cursor_row.saturating_sub(usize::from(rows[1].height) / 2))
+        .unwrap_or(u16::MAX);
+    frame.render_widget(
+        Paragraph::new(draft_rows.join("\n")).scroll((scroll, 0)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                if pending {
+                    "Conferring… You can edit the next draft. Esc closes."
+                } else {
+                    "Enter send · Ctrl-U clear · Esc keeps draft"
+                },
+                theme::muted(),
+            )),
+            Line::from(Span::styled(
+                "Plan changes need separate preview and approval with p.",
+                theme::muted(),
+            )),
+        ])
+        .wrap(Wrap { trim: false }),
+        rows[2],
+    );
+}
+
+fn render_plan_confirmation(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(preview) = state.lead_plan_preview.as_ref() else {
+        return;
+    };
+    let block = overlay_block(" Plan changes · approval required ", theme::attention());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Mission {} · turn {}\n",
+            preview.mission_id, preview.approval.stage_id
+        ))
+        .style(theme::muted()),
+        rows[0],
+    );
+    let lines = plan_preview_rows(&preview.text, rows[1].width);
+    let maximum = lines.len().saturating_sub(usize::from(rows[1].height));
+    let scroll = u16::try_from(state.lead_plan_scroll.min(maximum)).unwrap_or(u16::MAX);
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).scroll((scroll, 0)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(if state.lead_plan_pending_ticket.is_some() {
+            "Applying inspected changes…\nEsc closes; approval continues."
+        } else {
+            "↑/↓ · PgUp/PgDn scroll · Home top\nEnter approve this batch · Esc cancel"
+        })
+        .style(theme::muted()),
+        rows[2],
+    );
+}
+
+/// Wraps the full batch without the notification footer's truncation cap.
+/// Every proposed field must remain reachable before approval.
+fn plan_preview_rows(text: &str, width: u16) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut row = String::new();
+        for character in line.chars() {
+            let mut candidate = row.clone();
+            candidate.push(character);
+            if !row.is_empty() && Span::raw(candidate.as_str()).width() > usize::from(width.max(1))
+            {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push(character);
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// How long a pull request check may go unanswered before the starting card
@@ -3746,6 +3884,45 @@ mod tests {
     use crate::app::{RouteSummary, RunListItem, StageSummary, StageWaitingSummary, UsageSummary};
     use crate::domain::{EffortSetting, Role, RunId, StageId, StageKind, WorkflowKind};
     use crate::tui::state::StageHeadline;
+
+    #[test]
+    fn proposal_preview_wraps_all_content_without_truncating_long_fields() {
+        let text = format!(
+            "Scope: {}\nLast criterion: città 界",
+            "long field ".repeat(100)
+        );
+        let rows = plan_preview_rows(&text, 30);
+        assert!(rows.len() > 4);
+        assert_eq!(rows.concat(), text.replace('\n', ""));
+        assert!(rows.iter().all(|row| Span::raw(row.as_str()).width() <= 30));
+    }
+
+    #[test]
+    fn plan_confirmation_keeps_approval_visible_at_the_end_of_a_long_batch() {
+        let mut state = TuiState::new(std::path::Path::new("/tmp"));
+        state.overlay = Some(Overlay::PlanConfirm);
+        state.lead_plan_scroll = usize::MAX;
+        state.lead_plan_preview = Some(crate::app::LeadPlanPreview {
+            mission_id: crate::domain::MissionId::from_u128(3),
+            approval: crate::store::LeadProposalApproval {
+                mission_revision: crate::store::MissionRevision::initial(),
+                run_id: RunId::from_u128(9),
+                run_revision: crate::store::RunRevision::initial(),
+                stage_id: StageId::new("lead_1").unwrap(),
+                answer_sha256: "a".repeat(64),
+            },
+            changes: vec![],
+            text: format!(
+                "{}\nLAST ACCEPTANCE CRITERION",
+                "proposal field\n".repeat(80)
+            ),
+        });
+        let text = render_text(&state, 100, 30);
+        assert!(text.contains("LAST ACCEPTANCE CRITERION"));
+        assert!(text.contains("Enter approve this batch"));
+        assert!(text.contains("Esc cancel"));
+        assert!(!render_text(&state, 1, 1).is_empty());
+    }
 
     // POD's legs, folded to half-blocks: the one art fragment every scene
     // keeps, so it marks "POD is on screen" regardless of costume or prop.

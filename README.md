@@ -92,12 +92,13 @@ A mission is the project goal above any one run: a plan of Orders with dependenc
 senate mission new "<title>" --goal "<goal>"
 senate mission add <mission-id> <order-id> --title "<title>" --goal "<goal>" --accept "<criterion>"
 senate mission start <mission-id> <order-id>
+senate mission drive <mission-id> --max-parallel 4
 senate mission integrate <mission-id> <order-id>
 senate mission ask <mission-id> "<question>"
 senate mission show <mission-id>
 ```
 
-`senate mission ask` talks to the Consul directly; its proposed plan changes land only when you run `mission apply`. The `M` screen in the TUI lists missions, starts a ready Order, integrates a delivered one, and opens an Order's run. See [docs/features/missions.md](docs/features/missions.md).
+`senate mission ask` talks to the Consul directly; its proposed plan changes land only when you run `mission apply`. The `M` screen in the TUI lists missions, starts a ready Order, integrates a delivered one, and opens an Order's run. On an open Mission, `C` chats with the Consul and `p` previews full Plan changes before Enter approves them. `mission drive` starts Ready packages within a persisted concurrency cap, resumes bound Runs after restart, and pauses dispatch when operator attention, integration or a source commit is needed. See [docs/features/missions.md](docs/features/missions.md).
 
 ## Workflows
 
@@ -169,6 +170,7 @@ senate tui       # same, explicit
 | Run | `a`, `P`, `X` | Apply, push to PR, discard (with confirmation) |
 | Run | `f`, `c`, `w` | Fix a decision, continue with a new instruction, work its follow-ups |
 | Missions | `M`, `S`, `I` | Missions screen, start a ready Order, integrate a delivered one |
+| Missions | `C`, `p` | Chat with Consul; preview and approve Plan changes |
 | Missions | `W` | Enter the Senate (open the 3D view) |
 
 Full key map: [docs/features/control-room.md](docs/features/control-room.md).

@@ -6,16 +6,15 @@
 //! commits the aggregate with its event batch under compare-and-swap.
 //! Run state is never inferred from anything but the run store.
 
-use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
 use crate::domain::{
-    DecisionAuthor, DecisionId, IntegrationEvidence, Mission, MissionChange, MissionError,
-    MissionId, PlanChange, RunId, RunStatus, WorkPackage, WorkPackageContract, WorkPackageId,
-    WorkPackageStatus, WorkflowKind,
+    DecisionAuthor, DecisionId, IntegrationEvidence, Mission, MissionChange, MissionId, PlanChange,
+    RunId, RunStatus, WorkPackage, WorkPackageContract, WorkPackageId, WorkPackageStatus,
+    WorkflowKind,
 };
 use crate::git::GitRepository;
 use crate::store::{
@@ -36,10 +35,10 @@ use super::{
 /// Use-case boundary for missions. Opens the store per call, like
 /// [`RunService`], so several processes can share one database.
 pub struct MissionService {
-    database: PathBuf,
+    pub(super) database: PathBuf,
     /// Root of the managed worktrees, read to capture a delivered run's
     /// delta; never written from here.
-    worktrees: PathBuf,
+    pub(super) worktrees: PathBuf,
 }
 
 /// One package as the lead or user describes it before it exists.
@@ -212,45 +211,31 @@ impl MissionService {
         let report = if let Some(run_id) = current {
             runs.request_lead_turn(run_id, &instruction)?
         } else {
-            let bound: RefCell<Option<Result<(), AppError>>> = RefCell::new(None);
-            let report = runs.start_run_observed(
+            let persist = |store: &mut SqliteStore,
+                           run: &crate::domain::Run,
+                           input: &crate::store::RunInput,
+                           config: &crate::store::ResolvedConfigSnapshot,
+                           events: &[crate::domain::DomainEvent]| {
+                store.create_mission_lead_run_with_input(
+                    run,
+                    input,
+                    config,
+                    events,
+                    mission_id,
+                    *run.created_at(),
+                )?;
+                Ok(())
+            };
+            runs.start_run_bound_observed(
                 WorkflowKind::Lead,
                 instruction,
                 &repository,
                 selection,
                 effort,
                 &ImageGenerationPlan::disabled(),
-                &|progress| {
-                    if let StartProgress::PreparingWorkspace(run_id) = progress
-                        && bound.borrow().is_none()
-                    {
-                        let outcome = SqliteStore::open(&self.database)
-                            .and_then(|mut store| {
-                                store.bind_mission_lead(mission_id, run_id, &now())
-                            })
-                            .map_err(AppError::from);
-                        *bound.borrow_mut() = Some(outcome);
-                    }
-                },
-            )?;
-            match bound.into_inner() {
-                Some(Ok(())) => {}
-                Some(Err(error)) => {
-                    return Err(AppError::LeadRunUnbound {
-                        mission_id,
-                        run_id: report.details.id,
-                        reason: error.to_string(),
-                    });
-                }
-                None => {
-                    return Err(AppError::LeadRunUnbound {
-                        mission_id,
-                        run_id: report.details.id,
-                        reason: "the run never reported being persisted".to_owned(),
-                    });
-                }
-            }
-            report
+                &|_| {},
+                Some(&persist),
+            )?
         };
         let mut store = SqliteStore::open(&self.database)?;
         let answer = mission_lead::latest_answer(&mut store, report.details.id)?;
@@ -281,17 +266,8 @@ impl MissionService {
     /// Returns an error when there is no answer, when the answer's section
     /// cannot be read, or when a change is refused by the plan.
     pub fn apply_lead_proposals(&self, mission_id: MissionId) -> Result<MissionDetails, AppError> {
-        let answer = self
-            .latest_lead_answer(mission_id)?
-            .ok_or(AppError::NoLeadAnswer(mission_id))?;
-        let changes = answer
-            .proposals
-            .map_err(|source| AppError::LeadProposalUnreadable {
-                run_id: answer.run_id,
-                stage_id: answer.stage_id.clone(),
-                source,
-            })?;
-        self.apply_plan_changes(mission_id, &changes)
+        let preview = self.preview_lead_proposals(mission_id)?;
+        self.approve_lead_proposals(&preview)
     }
 
     /// Applies a list of plan changes atomically, in order.
@@ -304,67 +280,7 @@ impl MissionService {
         changes: &[PlanChange],
     ) -> Result<MissionDetails, AppError> {
         self.mutate(mission_id, |mission, now| {
-            let mut events = Vec::new();
-            for change in changes {
-                let change = match change.clone() {
-                    PlanChange::AddPackage {
-                        id,
-                        contract,
-                        dependencies,
-                    } => mission.add_package(id, contract, dependencies, now)?,
-                    PlanChange::RevisePackage {
-                        id,
-                        title,
-                        goal,
-                        rationale,
-                        scope,
-                        acceptance_criteria,
-                        verification,
-                        workflow,
-                        dependencies,
-                    } => {
-                        let current = mission
-                            .package(&id)
-                            .ok_or_else(|| MissionError::PackageNotFound(mission.id(), id.clone()))?
-                            .contract()
-                            .clone();
-                        let contract = WorkPackageContract {
-                            title: title.unwrap_or_else(|| current.title.clone()),
-                            goal: goal.unwrap_or_else(|| current.goal.clone()),
-                            rationale: rationale.unwrap_or_else(|| current.rationale.clone()),
-                            scope: scope.unwrap_or_else(|| current.scope.clone()),
-                            acceptance_criteria: acceptance_criteria
-                                .unwrap_or_else(|| current.acceptance_criteria.clone()),
-                            verification: verification
-                                .unwrap_or_else(|| current.verification.clone()),
-                            workflow: workflow.unwrap_or(current.workflow),
-                        };
-                        let mut change = if contract == current {
-                            MissionChange { events: Vec::new() }
-                        } else {
-                            mission.revise_contract(&id, contract, now)?
-                        };
-                        if let Some(dependencies) = dependencies {
-                            change
-                                .events
-                                .extend(mission.set_dependencies(&id, dependencies, now)?.events);
-                        }
-                        change
-                    }
-                    PlanChange::CancelPackage { id, reason } => {
-                        mission.cancel_package(&id, reason, now)?
-                    }
-                    PlanChange::RecordDecision { title, rationale } => mission.record_decision(
-                        DecisionId::new(),
-                        title,
-                        rationale,
-                        DecisionAuthor::Lead,
-                        now,
-                    )?,
-                };
-                events.extend(change.events);
-            }
-            Ok(MissionChange { events })
+            super::mission_plan::apply_changes(mission, changes, now)
         })
     }
 
@@ -424,8 +340,7 @@ impl MissionService {
     ///
     /// # Errors
     /// Returns domain rule violations, run start failures, or persistence
-    /// errors. When the run started but could not be bound, the error names
-    /// it so it can be attached by hand.
+    /// errors. Run creation and binding roll back together on refusal.
     pub fn start_package<F>(
         &self,
         runs: &RunService<F>,
@@ -473,7 +388,50 @@ impl MissionService {
         clippy::too_many_arguments,
         reason = "one start, every choice it takes"
     )]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "owned execution choices cloned only for bounded CAS retries"
+    )]
     pub fn start_package_with<F>(
+        &self,
+        runs: &RunService<F>,
+        mission_id: MissionId,
+        package_id: &WorkPackageId,
+        selection: Option<ExecutionSelection>,
+        effort: EffortRequest,
+        auto_approve: bool,
+        observe: &dyn Fn(StartProgress),
+    ) -> Result<(ExecutionReport, MissionDetails), AppError>
+    where
+        F: ProviderFactory,
+    {
+        for attempt in 0..32 {
+            let result = self.start_package_once(
+                runs,
+                mission_id,
+                package_id,
+                selection.clone(),
+                effort.clone(),
+                auto_approve,
+                observe,
+            );
+            if matches!(
+                &result,
+                Err(AppError::Store(
+                    crate::store::StoreError::MissionConcurrentModification { .. }
+                ))
+            ) && attempt < 31
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            return result;
+        }
+        unreachable!("bounded retry returns on its last attempt")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_package_once<F>(
         &self,
         runs: &RunService<F>,
         mission_id: MissionId,
@@ -524,37 +482,41 @@ impl MissionService {
         let repository = PathBuf::from(loaded.input.source_repo_path());
         drop(store);
 
-        let bound: RefCell<Option<Result<(), AppError>>> = RefCell::new(None);
+        let persist = |store: &mut SqliteStore,
+                       run: &crate::domain::Run,
+                       input: &crate::store::RunInput,
+                       config: &crate::store::ResolvedConfigSnapshot,
+                       run_events: &[crate::domain::DomainEvent]| {
+            let mut mission = loaded.mission.clone();
+            let change = mission.start_package(package_id, run.id(), *run.created_at())?;
+            let handoff = MissionHandoffRecord {
+                run_id: run.id(),
+                created_at: *run.created_at(),
+                ..handoff.clone()
+            };
+            store.create_mission_run_with_input(
+                run,
+                input,
+                config,
+                run_events,
+                &mission,
+                loaded.revision,
+                &change.events,
+                &handoff,
+                auto_approve,
+            )?;
+            Ok(())
+        };
         let report = runs
-            .start_run_observed(
+            .start_run_bound_observed(
                 workflow,
                 task,
                 &repository,
                 selection,
                 effort,
                 &ImageGenerationPlan::disabled(),
-                &|progress| {
-                    observe(progress.clone());
-                    if let StartProgress::PreparingWorkspace(run_id) = progress
-                        && bound.borrow().is_none()
-                    {
-                        let handoff = MissionHandoffRecord {
-                            run_id,
-                            ..handoff.clone()
-                        };
-                        let outcome = self
-                            .bind_run(mission_id, package_id, run_id, Some(&handoff))
-                            .map(|_| ())
-                            .and_then(|()| {
-                                if auto_approve {
-                                    runs.set_run_auto_approve(run_id, true)
-                                } else {
-                                    Ok(())
-                                }
-                            });
-                        *bound.borrow_mut() = Some(outcome);
-                    }
-                },
+                observe,
+                Some(&persist),
             )
             .map_err(|error| match error {
                 AppError::DirtySourceRepository => AppError::MissionIntegrationNeedsCommit {
@@ -563,25 +525,6 @@ impl MissionService {
                 },
                 error => error,
             })?;
-        match bound.into_inner() {
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
-                return Err(AppError::PackageRunUnbound {
-                    mission_id,
-                    package_id: package_id.clone(),
-                    run_id: report.details.id,
-                    reason: error.to_string(),
-                });
-            }
-            None => {
-                return Err(AppError::PackageRunUnbound {
-                    mission_id,
-                    package_id: package_id.clone(),
-                    run_id: report.details.id,
-                    reason: "the run never reported being persisted".to_owned(),
-                });
-            }
-        }
         let details = self.inspect_mission(mission_id)?;
         Ok((report, details))
     }
@@ -696,7 +639,12 @@ impl MissionService {
                 .status();
             if matches!(
                 status,
-                RunStatus::Ready | RunStatus::Running | RunStatus::Paused | RunStatus::Interrupted
+                RunStatus::Created
+                    | RunStatus::Preparing
+                    | RunStatus::Ready
+                    | RunStatus::Running
+                    | RunStatus::Paused
+                    | RunStatus::Interrupted
             ) {
                 reports.push(runs.resume_run(run_id)?);
             }
@@ -885,7 +833,7 @@ impl MissionService {
     }
 }
 
-fn now() -> DateTime<Utc> {
+pub(super) fn now() -> DateTime<Utc> {
     std::time::SystemTime::now().into()
 }
 
@@ -893,7 +841,29 @@ fn now() -> DateTime<Utc> {
 /// whatever moved. Reads run state only; never drives a run. Delivery
 /// evidence is captured from the run store at the moment a completion is
 /// first observed, and only then.
-fn observe_runs(
+pub(super) fn observe_runs(
+    store: &mut SqliteStore,
+    worktrees: &Path,
+    mission_id: MissionId,
+) -> Result<LoadedMission, AppError> {
+    for attempt in 0..32 {
+        let result = observe_runs_once(store, worktrees, mission_id);
+        if matches!(
+            &result,
+            Err(AppError::Store(
+                crate::store::StoreError::MissionConcurrentModification { .. }
+            ))
+        ) && attempt < 31
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        return result;
+    }
+    unreachable!("bounded observation retry returns on its last attempt")
+}
+
+fn observe_runs_once(
     store: &mut SqliteStore,
     worktrees: &Path,
     mission_id: MissionId,
@@ -1226,6 +1196,261 @@ mod tests {
             .unwrap()
             .insert_artifact(&artifact)
             .unwrap();
+    }
+
+    fn proposed_decision(fixture: &Fixture) -> (MissionId, super::super::LeadPlanPreview) {
+        let missions = fixture.missions();
+        let mission = missions
+            .create_mission("Preview", "Inspect changes", &fixture.repo)
+            .unwrap();
+        let (turn, _) = missions
+            .ask_lead(
+                &fixture.runs(),
+                mission.id,
+                "Propose a decision",
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        write_lead_artifact(
+            fixture,
+            turn.report.details.id,
+            &StageId::new("lead_1").unwrap(),
+            "## Plan changes\n\n- decide: Keep explicit integration\n  why: Review source changes before dependencies start\n",
+        );
+        (
+            mission.id,
+            missions.preview_lead_proposals(mission.id).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_preview_is_read_only_and_a_decision_only_batch_applies_once() {
+        let fixture = Fixture::new();
+        let (mission_id, preview) = proposed_decision(&fixture);
+        let missions = fixture.missions();
+        assert!(
+            missions
+                .inspect_mission(mission_id)
+                .unwrap()
+                .decisions
+                .is_empty()
+        );
+        assert!(
+            preview
+                .text
+                .contains("Review source changes before dependencies start")
+        );
+        assert_eq!(
+            missions
+                .approve_lead_proposals(&preview)
+                .unwrap()
+                .decisions
+                .len(),
+            1
+        );
+        assert!(matches!(
+            missions.preview_lead_proposals(mission_id),
+            Err(AppError::Store(
+                crate::store::StoreError::LeadProposalAlreadyApplied { .. }
+            ))
+        ));
+        assert!(missions.approve_lead_proposals(&preview).is_err());
+        assert_eq!(
+            missions
+                .inspect_mission(mission_id)
+                .unwrap()
+                .decisions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_changed_mission_refuses_the_pinned_preview_without_applying_it() {
+        let fixture = Fixture::new();
+        let (mission_id, preview) = proposed_decision(&fixture);
+        let missions = fixture.missions();
+        missions
+            .record_decision(
+                mission_id,
+                "Operator choice",
+                "Changed plan",
+                DecisionAuthor::User,
+            )
+            .unwrap();
+        assert!(matches!(missions.approve_lead_proposals(&preview),
+            Err(AppError::Store(crate::store::StoreError::LeadProposalStale(id))) if id == mission_id));
+        let details = missions.inspect_mission(mission_id).unwrap();
+        assert_eq!(details.decisions.len(), 1);
+        assert_eq!(details.decisions[0].author, DecisionAuthor::User);
+    }
+
+    #[test]
+    fn a_new_consul_turn_refuses_a_preview_even_if_no_new_artifact_exists() {
+        let fixture = Fixture::new();
+        let (mission_id, preview) = proposed_decision(&fixture);
+        let missions = fixture.missions();
+        missions
+            .ask_lead(
+                &fixture.runs(),
+                mission_id,
+                "Reconsider",
+                None,
+                EffortRequest::ProfileDefault,
+            )
+            .unwrap();
+        assert!(matches!(missions.approve_lead_proposals(&preview),
+            Err(AppError::Store(crate::store::StoreError::LeadProposalStale(id))) if id == mission_id));
+        assert!(
+            missions
+                .inspect_mission(mission_id)
+                .unwrap()
+                .decisions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn drive_recovers_a_bound_run_after_a_crash_before_workspace_preparation() {
+        let fixture = Fixture::new();
+        let missions = fixture.missions();
+        let mission = missions
+            .create_mission_with_packages(
+                "Recovery",
+                "Resume work",
+                &fixture.repo,
+                vec![package("core", "Core", &[])],
+            )
+            .unwrap();
+        let run_id = std::cell::Cell::new(None);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            missions.start_package_observed(
+                &fixture.runs(),
+                mission.id,
+                &WorkPackageId::new("core").unwrap(),
+                Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                EffortRequest::ProfileDefault,
+                &|progress| {
+                    if let StartProgress::PreparingWorkspace(id) = progress {
+                        run_id.set(Some(id));
+                        panic!("simulated crash after atomic binding");
+                    }
+                },
+            )
+        }));
+        assert!(crashed.is_err());
+        let run_id = run_id.get().unwrap();
+        let mut store = SqliteStore::open(&fixture.database).unwrap();
+        assert_eq!(
+            store.load_run(run_id).unwrap().run.status(),
+            RunStatus::Created
+        );
+        assert!(store.load_workspace(run_id).unwrap().is_none());
+        drop(store);
+        let driven = fixture
+            .missions()
+            .drive_mission(
+                &fixture.runs(),
+                mission.id,
+                super::super::MissionDriveOptions {
+                    once: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(driven.details.packages[0].current_run, Some(run_id));
+        assert_eq!(
+            driven.details.packages[0].status,
+            WorkPackageStatus::Delivered
+        );
+        assert_eq!(fixture.runs().list_runs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn drive_recovers_interruption_but_preserves_a_persisted_operator_pause() {
+        use crate::domain::{EventId, EventMetadata, RunTransition};
+        for suspension in [RunTransition::Pause, RunTransition::Interrupt] {
+            let fixture = Fixture::new();
+            let missions = fixture.missions();
+            let mission = missions
+                .create_mission_with_packages(
+                    "Suspend",
+                    "Recover safely",
+                    &fixture.repo,
+                    vec![package("core", "Core", &[]), package("later", "Later", &[])],
+                )
+                .unwrap();
+            let run_id = std::cell::Cell::new(None);
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                missions.start_package_observed(
+                    &fixture.runs(),
+                    mission.id,
+                    &WorkPackageId::new("core").unwrap(),
+                    Some(ExecutionSelection::Uniform(UniformProvider::Fake)),
+                    EffortRequest::ProfileDefault,
+                    &|progress| {
+                        if let StartProgress::Running(id) = progress {
+                            run_id.set(Some(id));
+                            panic!("simulated exit before execution");
+                        }
+                    },
+                )
+            }));
+            assert!(crashed.is_err());
+            let run_id = run_id.get().unwrap();
+            let mut store = SqliteStore::open(&fixture.database).unwrap();
+            let mut loaded = store.load_run(run_id).unwrap();
+            let started = loaded
+                .run
+                .transition(
+                    RunTransition::Start,
+                    EventMetadata::new(EventId::new(), now()),
+                )
+                .unwrap();
+            let suspended = loaded
+                .run
+                .transition(suspension, EventMetadata::new(EventId::new(), now()))
+                .unwrap();
+            store
+                .commit_run_update(&loaded.run, loaded.revision, &[started, suspended])
+                .unwrap();
+            drop(store);
+            let driven = fixture
+                .missions()
+                .drive_mission(
+                    &fixture.runs(),
+                    mission.id,
+                    super::super::MissionDriveOptions {
+                        once: true,
+                        max_parallel: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let core = driven
+                .details
+                .package(&WorkPackageId::new("core").unwrap())
+                .unwrap();
+            assert_eq!(core.current_run, Some(run_id));
+            if suspension == RunTransition::Pause {
+                assert_eq!(core.run_status, Some(RunStatus::Paused));
+                assert_eq!(core.status, WorkPackageStatus::Blocked);
+                assert!(driven.reports.is_empty());
+            } else {
+                assert_eq!(core.status, WorkPackageStatus::Delivered);
+                assert_eq!(driven.reports.len(), 1);
+            }
+            assert_eq!(
+                driven
+                    .details
+                    .package(&WorkPackageId::new("later").unwrap())
+                    .unwrap()
+                    .status,
+                WorkPackageStatus::Ready
+            );
+            assert_eq!(fixture.runs().list_runs().unwrap().len(), 1);
+        }
     }
 
     /// The lead is one run per mission: the first question starts it, each

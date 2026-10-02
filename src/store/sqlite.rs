@@ -220,7 +220,7 @@ impl SqliteStore {
         config_snapshot: &ResolvedConfigSnapshot,
         events: &[DomainEvent],
     ) -> Result<CommitResult, StoreError> {
-        self.create_run_internal(run, config_snapshot, None, events)
+        self.create_run_internal(run, config_snapshot, None, events, |_| Ok(()))
     }
 
     /// Atomically inserts immutable input, config, initial run, and events.
@@ -234,7 +234,26 @@ impl SqliteStore {
         config_snapshot: &ResolvedConfigSnapshot,
         events: &[DomainEvent],
     ) -> Result<CommitResult, StoreError> {
-        self.create_run_internal(run, config_snapshot, Some(input), events)
+        self.create_run_internal(run, config_snapshot, Some(input), events, |_| Ok(()))
+    }
+
+    /// Atomically inserts a run and input, then lets a related store projection
+    /// commit on the same write transaction before the run becomes visible.
+    ///
+    /// The hook runs after config, run, input, and initial events are inserted.
+    /// Returning an error rolls all of them back.
+    ///
+    /// # Errors
+    /// As [`Self::create_run_with_input`], plus any error returned by `after_insert`.
+    pub(crate) fn create_run_with_input_hook(
+        &mut self,
+        run: &Run,
+        input: &RunInput,
+        config_snapshot: &ResolvedConfigSnapshot,
+        events: &[DomainEvent],
+        after_insert: impl FnOnce(&Transaction<'_>) -> Result<(), StoreError>,
+    ) -> Result<CommitResult, StoreError> {
+        self.create_run_internal(run, config_snapshot, Some(input), events, after_insert)
     }
 
     fn create_run_internal(
@@ -243,6 +262,7 @@ impl SqliteStore {
         config_snapshot: &ResolvedConfigSnapshot,
         input: Option<&RunInput>,
         events: &[DomainEvent],
+        after_insert: impl FnOnce(&Transaction<'_>) -> Result<(), StoreError>,
     ) -> Result<CommitResult, StoreError> {
         run.validate_invariants()?;
         if run.config_snapshot_id() != config_snapshot.id() {
@@ -304,6 +324,7 @@ impl SqliteStore {
             insert_run_input(&transaction, input)?;
         }
         insert_events(&transaction, run, events, 1)?;
+        after_insert(&transaction)?;
         transaction.commit()?;
 
         Ok(CommitResult {
@@ -1520,6 +1541,44 @@ mod tests {
         let (run, events) = complex_run(run_value, config_id, event_base);
         store.create_run(&run, &config, &events).unwrap();
         (run, events, config)
+    }
+
+    #[test]
+    fn failed_creation_hook_rolls_back_run_input_config_and_events() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let config = config("hook-rollback");
+        let (run, events) = complex_run(9_001, "hook-rollback", 50_000);
+        let input = RunInput::new(run.id(), "hook rollback task", *run.created_at()).unwrap();
+
+        let error = store
+            .create_run_with_input_hook(&run, &input, &config, &events, |_| {
+                Err(StoreError::SnapshotProjectionMismatch(
+                    "injected hook failure",
+                ))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::SnapshotProjectionMismatch("injected hook failure")
+        ));
+        assert!(matches!(
+            store.load_run(run.id()),
+            Err(StoreError::RunNotFound(id)) if id == run.id()
+        ));
+        assert!(store.load_run_input(run.id()).unwrap().is_none());
+        assert!(matches!(
+            store.load_config_snapshot(config.id()),
+            Err(StoreError::ConfigSnapshotNotFound(_))
+        ));
+        let run_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1",
+                [run.id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 0);
     }
 
     /// Several processes open a fresh database at once: the control room, a
