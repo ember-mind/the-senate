@@ -16,6 +16,8 @@ mod terminal;
 mod theme;
 mod worker;
 
+pub(crate) use desktop::open_local_file;
+
 use anyhow::Result;
 
 /// Opens interactive local control room.

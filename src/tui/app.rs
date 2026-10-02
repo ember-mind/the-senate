@@ -772,6 +772,7 @@ impl TuiApp {
             Intent::Attention if detail => self.open_package_attention(),
             Intent::AutoApprove if detail => self.toggle_mission_auto_approve(),
             Intent::EnterSenate => self.enter_senate(),
+            Intent::OpenRecap => self.open_recap(),
             Intent::DismissMessage => self.state.dismiss_message(),
             Intent::Help => self.state.overlay = Some(Overlay::Help),
             _ => {}
@@ -790,6 +791,32 @@ impl TuiApp {
             Err(reason) => self.state.notify(
                 UiMessageKind::Error,
                 format!("Could not open the Senate: {reason}"),
+            ),
+        }
+    }
+
+    /// `B`: snapshot committed campaign evidence and open its local brief.
+    fn open_recap(&mut self) {
+        let Some(mission_id) = self.state.selected_mission else {
+            return;
+        };
+        match self.missions.open_recap(mission_id, &[]) {
+            Ok(path) => match desktop::open_local_file(&path) {
+                Ok(()) => self.state.notify(
+                    UiMessageKind::Info,
+                    format!("Opening recap: {}", path.display()),
+                ),
+                Err(reason) => self.state.notify(
+                    UiMessageKind::Error,
+                    format!(
+                        "Recap saved at {} but could not open: {reason}",
+                        path.display()
+                    ),
+                ),
+            },
+            Err(error) => self.state.notify(
+                UiMessageKind::Error,
+                format!("Could not make recap: {error}"),
             ),
         }
     }

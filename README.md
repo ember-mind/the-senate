@@ -95,9 +95,10 @@ senate mission start <mission-id> <order-id>
 senate mission integrate <mission-id> <order-id>
 senate mission ask <mission-id> "<question>"
 senate mission show <mission-id>
+senate mission recap <mission-id> --open
 ```
 
-`senate mission ask` talks to the Consul directly; its proposed plan changes land only when you run `mission apply`. The `M` screen in the TUI lists missions, starts a ready Order, integrates a delivered one, and opens an Order's run. See [docs/features/missions.md](docs/features/missions.md).
+`senate mission ask` talks to the Consul directly; its proposed plan changes land only when you run `mission apply`. The `M` screen in the TUI lists missions, starts a ready Order, integrates a delivered one, and opens an Order's run. `B` opens a local HTML recap: integrated work, test and review evidence, decisions, and unfinished Orders. The Consul's words are labelled as narrative, separate from committed facts. See [docs/features/missions.md](docs/features/missions.md).
 
 ## Workflows
 

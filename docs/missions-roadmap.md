@@ -148,7 +148,7 @@ watch agents work?
   overlay.
 - Nothing shows per-file agent activity by default.
 
-### M5 — Progress brief
+### M5 — Progress brief (implemented)
 
 - Structured brief model built from canonical facts (integrated packages,
   changed files, verification, review outcome, decisions, unfinished
@@ -159,6 +159,15 @@ watch agents work?
   technical section collapsed; optional visual evidence slots.
 - Generated on request (`Open recap`), on milestone completion, and on
   decision requests; never per event.
+
+Implemented as `senate mission recap <id> [--visual <local-image> ...] [--open]`
+and `B` from the campaign TUI. The HTML and JSON are immutable snapshots at
+`<data-dir>/missions/<id>/briefs/<sha256>/`; local images are copied into the
+snapshot. Integrated package evidence, decisions and unfinished work come from
+the mission read model; latest Consul prose is labelled narrative. Automatic
+snapshots are attempted after package integration, mission completion, new
+run attention, and a Consul plan-change proposal. A failed automatic file
+write never rolls back the already-committed mission change.
 
 ### M6 — Richer orchestration
 

@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::domain::{
     DecisionAuthor, DecisionId, Mission, MissionAttention, MissionId, MissionStatus, RunId,
@@ -29,7 +30,7 @@ pub struct MissionListItem {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DecisionSummary {
     pub id: DecisionId,
     pub title: String,
