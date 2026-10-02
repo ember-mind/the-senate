@@ -9,6 +9,7 @@
 <body>
 <canvas id="world"></canvas>
 <div id="labels"></div>
+<section id="map-preview" hidden aria-label="2D game world"></section>
 
 <header id="brand">
   <span class="mark"></span>
@@ -22,6 +23,7 @@
 <nav id="views" aria-label="View">
   <button data-view="overview" class="on">Overview</button>
   <button id="battle-view">Battle</button>
+  <button id="map-view">2D Game</button>
   <button data-view="walk">Walk</button>
 </nav>
 
@@ -45,6 +47,6 @@
   <div class="sub">Entering…</div>
 </div>
 
-<script type="module" src="js/main.js"></script>
+<script type="module" src="js/entry.js"></script>
 </body>
 </html>

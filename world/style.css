@@ -141,3 +141,64 @@ body.tour .label b { font-size: 22px; }
 body.tour .label span { font-size: 28px; }
 body.tour .label span.t { font-size: 32px; }
 body.tour .label span.d, body.tour .label.place { display: none; }
+
+/* Painted, opt-in 2D game preview. HUD stays around the playable world. */
+body[data-mode="game"] { background: #26372a; }
+body[data-mode="game"] #world, body[data-mode="game"] #labels, body[data-mode="game"] #help { display: none; }
+body[data-mode="game"] #map-preview { position: fixed; inset: 0; }
+#game-world { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+body[data-mode="game"] #brand {
+  background: linear-gradient(135deg, #14271def, #27352ceb); color: #f3e4c5;
+  border: 1px solid #d4b27560; border-radius: 4px; box-shadow: 0 5px 25px #07120b55;
+  padding: 12px 18px 12px 14px; backdrop-filter: blur(10px); max-width: calc(100vw - 420px);
+}
+body[data-mode="game"] #brand .name { color: #cdb27b; font-size: 10px; letter-spacing: .24em; }
+body[data-mode="game"] #brand .sub { font-size: 20px; }
+body[data-mode="game"] #brand .count { color: #d1c5ac; font-size: 11px; }
+body[data-mode="game"] #source { color: #dfbd7a; }
+body[data-mode="game"] .chip { background: #ffffff15; color: #c9d5b4; border: 1px solid #c9d5b42c; }
+body[data-mode="game"] .chip.needs { background: #923e2a; color: #ffe0b2; }
+body[data-mode="game"] #views { background: #17271fec; border-color: #d4b27560; border-radius: 4px; backdrop-filter: blur(10px); z-index: 2; }
+body[data-mode="game"] #views button { color: #d2c4a7; border-radius: 2px; }
+body[data-mode="game"] #views button.on { background: #c4a363; color: #17251c; box-shadow: inset 0 0 0 1px #e5ce94; }
+#game-tools { position: fixed; top: 72px; right: 16px; display: flex; gap: 4px; padding: 4px; background: #17271fdf; border: 1px solid #d4b27550; border-radius: 3px; backdrop-filter: blur(8px); }
+#game-tools button { padding: 7px 10px; border: 1px solid transparent; background: transparent; color: #e7d6b2; font: 600 11px var(--sans); cursor: pointer; border-radius: 2px; }
+#game-tools button:hover, #game-tools button:focus-visible { background: #d4b27524; border-color: #d4b27580; }
+#game-dock { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); min-width: 220px; max-width: min(610px, calc(100vw - 440px)); padding: 9px 13px 10px; background: linear-gradient(#233328f0, #112017f5); border: 1px solid #d4b27585; border-radius: 4px; box-shadow: 0 8px 30px #0d1b1466, inset 0 0 0 3px #00000012; backdrop-filter: blur(10px); }
+.dock-heading { display: flex; justify-content: space-between; gap: 20px; color: #d4b275; font: 700 9px var(--sans); letter-spacing: .16em; margin-bottom: 7px; }
+#game-count { color: #aebcaa; font-weight: 400; letter-spacing: 0; }
+#game-roster { display: flex; gap: 7px; overflow: auto; scrollbar-width: thin; scrollbar-color: #b99b62 #15241a; }
+.unit-portrait { flex: 0 0 53px; position: relative; width: 53px; height: 62px; border: 1px solid #8e825960; border-radius: 2px; padding: 0; background: radial-gradient(ellipse at 50% 30%, #57684b, #203025); cursor: pointer; overflow: hidden; }
+.unit-portrait .portrait-art { position: absolute; inset: -3px 0 4px; background: url('assets/game2d/characters.png') 0 0 / 400% 400%; }
+.unit-portrait b { position: absolute; bottom: 2px; left: 6px; color: #f0deb5; font: 700 10px var(--serif); text-shadow: 0 1px 3px #000; }
+.unit-portrait i { position: absolute; bottom: 5px; right: 5px; width: 5px; height: 5px; border-radius: 50%; box-shadow: 0 0 4px currentColor; }
+.unit-portrait:hover, .unit-portrait:focus-visible, .unit-portrait.selected { border-color: #e4c77e; box-shadow: inset 0 0 0 1px #e4c77e, 0 0 12px #e4c77e20; }
+.unit-portrait.needs { border-color: #db7758; }
+.empty-roster { color: #d1c5ac; font: italic 13px var(--serif); padding: 15px 3px; }
+#game-minimap { position: fixed; bottom: 18px; right: 16px; padding: 5px 5px 7px; background: #14261ced; border: 1px solid #d4b27585; border-radius: 3px; box-shadow: 0 5px 20px #07120b55; }
+#game-minimap canvas { display: block; width: 180px; height: 101px; cursor: crosshair; border: 1px solid #e6cf9240; }
+#game-minimap > span { display: block; color: #cdb27b; font: 8px var(--sans); letter-spacing: .16em; text-align: center; margin-top: 6px; }
+#game-selection { position: fixed; bottom: 18px; left: 16px; width: 236px; padding: 12px 15px; border-left: 2px solid #d4b275; background: linear-gradient(90deg, #14271ded, #14271dc0); backdrop-filter: blur(6px); }
+#game-selection small { display: block; font: 8px var(--sans); letter-spacing: .16em; color: #d4b275; }
+#game-selection strong { display: block; color: #f5e6c6; font: 600 18px/1.15 var(--serif); margin: 5px 0; }
+#game-selection > span { color: #c3d1b7; font: 11px var(--sans); }
+#game-hint { position: fixed; bottom: 150px; left: 18px; color: #f2e9ca; font: 10px var(--sans); text-shadow: 0 1px 3px #18230c, 0 0 10px #14200d; pointer-events: none; opacity: .9; }
+#game-hover { position: fixed; transform: translate(-50%, -100%); pointer-events: none; width: max-content; max-width: 250px; padding: 9px 13px; color: #f5e6c6; background: #15271feb; border: 1px solid #d4b2758c; border-radius: 3px; box-shadow: 0 5px 12px #07120b55; backdrop-filter: blur(8px); }
+#game-hover strong { display: block; font: 600 15px/1.2 var(--serif); }
+#game-hover span { display: block; color: #c9d5b4; font: 10px var(--sans); margin-top: 4px; }
+body.clean #game-tools, body.clean #game-dock, body.clean #game-minimap, body.clean #game-selection, body.clean #game-hint, body.clean #game-hover { display: none; }
+@media (max-width: 900px) {
+  body[data-mode="game"] #brand { max-width: calc(100vw - 32px); }
+  body[data-mode="game"] #views { top: 108px; }
+  #game-tools { top: 160px; }
+  #game-selection { display: none; }
+  #game-dock { left: 16px; transform: none; max-width: calc(100vw - 230px); min-width: 140px; }
+  #game-hint { display: none; }
+}
+@media (max-width: 520px) {
+  #game-minimap canvas { width: 110px; height: 62px; }
+  #game-minimap > span { font-size: 6px; }
+  #game-dock { max-width: calc(100vw - 155px); }
+  .unit-portrait { flex-basis: 43px; width: 43px; height: 54px; }
+  .dock-heading { letter-spacing: .08em; font-size: 8px; gap: 10px; }
+}

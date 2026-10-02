@@ -1,0 +1,25 @@
+2D game preview assets
+Generated with the built-in image_gen tool, 2026-10-02.
+
+Project assets:
+world/assets/game2d/campus.png
+world/assets/game2d/characters.png
+
+BACKGROUND PROMPT
+Use case: stylized-concept.
+Asset type: playable 2D game background for a Roman engineering-agent campus.
+Create a beautiful, polished hand-painted strategy-game environment, landscape 16:9, approximately 2048x1152. Orthographic overhead camera at 75 degrees down, no horizon, no cinematic perspective. The entire image is terrain for a 2D game, NOT a map diagram, NOT a dashboard, NOT a schematic. Rich painterly textures, inviting lush green grass, scattered tiny yellow and white wildflowers, warm golden late-afternoon light, long soft shadows, terracotta roof tiles, cream travertine masonry, leafy olive trees and tall cypresses, atmospheric but crisp and readable. Strong visual craft like a premium indie city-builder.
+Composition needed for runtime sprites: LEFT 45% is a broad clear grass-and-dirt battlefield, mostly empty, with a wooden barbarian fort on far left edge (about x=8%, y=40%), palisade, two watchtowers and a gate facing right. Battlefield grass must remain open from x=20% to x=45%, y=25% to y=75%. RIGHT 55% is a Roman campus: a pale stone wall with a large western gateway at x=52%, y=52%; a wide ochre road connects that gateway to battlefield. Inside campus: open marble Forum court at x=73%, y=49%, with a central circular gold-and-black eagle mosaic and fountain; colonnades around its edges; a red-tiled basilica / Legion Hall at x=63%, y=75%; a smaller round Censors' exedra, open courtyard not closed roof, at x=88%, y=59%; a grand Roman Curia with pediment and red roof at x=80%, y=23%; a library/archive with red tiled roof at x=92%, y=31%. Camera from south, roofs and north sides visible but all nearly overhead. Paths, gardens, statues, lamps, stairs and pots give natural environmental detail. Perimeter foliage frames bottom corners and edges, without covering battlefield or Forum. Buildings have convincing roof tiles and column shadows, detailed sprite-like readable silhouettes.
+No people, no soldiers, no creatures anywhere: all characters will be rendered live by code. No words, no labels, no UI, no borders, no grid, no symbols floating over buildings, no parchment. Full-bleed lush landscape.
+
+SPRITE ATLAS PROMPT
+Use case: stylized-concept.
+Asset type: transparent sprite atlas for a 2D Roman strategy game. Output square 1024x1024, genuinely transparent background.
+Exactly 4 columns by 4 rows, equal 256x256 invisible cells. Each cell contains exactly one fully visible small game character, centered on x=128 of its cell, feet at y=205, total character bounds within x=50..205, y=40..210. Large transparent gutters. No cell lines, text, labels, terrain, background, or cast shadow. Consistent hand-painted premium indie strategy-game art, warm sunlight, crisp edges, NOT pixel art, NOT photorealistic. Camera is high overhead at 65 degrees down with short visible faces, head and shoulders bigger than feet. All characters match scale.
+Row 1: Roman legionary facing LEFT (toward enemy), ivory tunic, bronze helmet with small crimson plume, bronze armour, crimson cape, oval dark crimson scutum in LEFT hand and short gladius in RIGHT hand.
+Row 2: barbarian warrior facing RIGHT, brown leather, grey fur shoulder cloak, dark hair, round wooden shield and small axe.
+Row 3: Roman Consul/senator facing toward bottom-left, cream toga with gold trim, small scroll, no weapons.
+Row 4: hooded Roman Censor/scholar facing toward bottom-left, burgundy robe, bronze belt and a wax tablet, no weapons.
+For EVERY ROW columns are four animation poses: column 1 idle standing, column 2 walking left foot forward, column 3 walking right foot forward, column 4 active pose (legionary sword thrust left, barbarian axe strike right, Consul pointing outward, Censor reading tablet).
+Keep character identity, size, cell-center and foot anchor consistent across its row. All 16 characters separate, no overlaps. Faces subtle and dignified. NO equipment projecting outside its cell.
+
